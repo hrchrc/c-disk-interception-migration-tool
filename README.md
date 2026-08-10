@@ -1,4 +1,4 @@
-# C盘拦迁器 (C Drive Relocator)
+# C盘拦迁器 (C Disk Interception Migration Tool)
 
 Windows 下的 C 盘空间管理工具。
 
@@ -49,7 +49,7 @@ C 盘空间总是不够用？这个工具可以把 C 盘中占用空间的大目
 
 ## 下载
 
-Windows 便携版 exe 在 [Releases](https://github.com/hrchrc/c-drive-relocator/releases) 页面：
+Windows 便携版 exe 在 [Releases](https://github.com/hrchrc/c-disk-interception-migration-tool/releases) 页面：
 
 - 单文件，已内置 Rust 引擎和词典，下载解压即可用
 - 建议以管理员身份运行
