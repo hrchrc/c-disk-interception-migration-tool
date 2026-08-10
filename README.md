@@ -37,6 +37,16 @@ C 盘空间总是不够用？这个工具可以把 C 盘中占用空间的大目
 - AI 识别：用大模型识别陌生目录的用途（可选功能，需配置 API Key，支持 13 个国内外平台）
 - 基于 MFT 索引的快速扫描：几百万文件秒级完成
 
+## 技术
+
+- **GUI**：Python 3.13 + PySide6
+- **复制引擎**：Rust 实现，reader/writer 多线程流水线 + 无缓冲 I/O，支持断点续传（checkpoint 记录 + CRC32 区间校验，中断后从断点继续，损坏数据自动重传）
+- **完整性校验**：BLAKE3 逐文件哈希比对
+- **快速扫描**：直接解析 NTFS $MFT 构建索引，几百万文件秒级扫描；Cython 加速模块作为 Rust 失败时的兜底路径
+- **符号链接**：优先目录符号链接（/D），失败自动降级 junction（/J），再不行用 PowerShell 兜底
+- **事务化迁移**：迁移/还原以事务记录方式执行，异常中断后下次启动自动恢复处理
+- **AI 识别**：OpenAI 兼容接口，支持 13 个国内外平台，批量识别 + 本地缓存
+
 ## 下载
 
 Windows 便携版 exe 在 [Releases](https://github.com/hrchrc/c-drive-relocator/releases) 页面：
