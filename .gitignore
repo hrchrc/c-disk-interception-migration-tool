@@ -1,0 +1,64 @@
+# ===== Python 缓存与构建产物 =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# ===== 虚拟环境 =====
+venv/
+.venv/
+env/
+
+# ===== IDE 与系统文件 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ===== 日志 =====
+logs/
+*.log
+
+# ===== 本地运行时配置（含用户敏感数据，勿提交） =====
+config.json
+state.json
+ai_keys.json
+ai_recognize_cache.json
+识别记录.json
+
+# ===== 运行时数据目录 =====
+dev_env_snapshots/
+
+# ===== 打包配置与本机辅助脚本 =====
+*.spec
+*.bat
+
+# ===== 打包产物（release 单独发布，不混入源码仓库）=====
+/C盘拦迁器.exe
+/data/
+
+# ===== 大体积测试数据与构建产物 =====
+ceshiwenjian/
+rust-engine/target/
+src/mft/mft_fast.c
+*.test_bak
+_china_sw_expand/
+winget-tmp/
+
+# ===== 数据备份（勿提交） =====
+*.bak
+*.backup_*
+*.bak_*
+
+# ===== 本地文档（私人，勿提交） =====
+*.docx
+
+# ===== 本地开发工具私有目录 =====
+.gitnexus/
+.openclaw/

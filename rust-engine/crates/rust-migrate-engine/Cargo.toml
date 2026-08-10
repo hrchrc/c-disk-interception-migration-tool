@@ -1,0 +1,36 @@
+[package]
+name = "rust-migrate-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rust-migrate-engine"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    # P2:软删除到回收站需 IFileOperation(COM)
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    # P5:硬链接 CreateHardLinkW 已在 Win32_Storage_FileSystem 内
+    # P5:ACL 已在 Win32_Security 内
+    # P5:符号链接 DeviceIoControl/FSCTL_* 已在 Win32_System_IO 内
+    # P8:SSD 盘型检测 IOCTL_STORAGE_QUERY_PROPERTY 在 Win32_System_Ioctl 内
+    "Win32_System_Ioctl",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+# P6:小文件读写分离流水线改用 std::thread 自管线程(读线程/写线程),
+# 不再需要 rayon 线程池(原 par_iter 批处理已由流水线取代)
+
+[build-dependencies]
+# 嵌入 Windows 版本资源(VS_VERSION_INFO):消除"无发布者/无描述"未知程序特征,
+# 降低 360 等启发式杀软对正规工具的误报率
+embed-resource = "2"

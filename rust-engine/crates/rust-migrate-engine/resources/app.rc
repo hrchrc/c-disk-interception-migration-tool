@@ -1,0 +1,36 @@
+// Windows version resource: standard PE metadata (company/product/description).
+// Eliminates the "unknown publisher / no description" signature that heuristic
+// AV engines (e.g. 360) flag as suspicious for otherwise legit tools.
+#include <winres.h>
+
+#define APP_VERSION 1,0,0,0
+#define APP_VERSION_STR "1.0.0.0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION APP_VERSION
+ PRODUCTVERSION APP_VERSION
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "CDriveMigrator"
+            VALUE "FileDescription", "C Drive Migration Engine"
+            VALUE "FileVersion", APP_VERSION_STR
+            VALUE "InternalName", "rust-migrate-engine"
+            VALUE "LegalCopyright", "Copyright (C) 2026 CDriveMigrator"
+            VALUE "OriginalFilename", "rust-migrate-engine.exe"
+            VALUE "ProductName", "C Drive Migrator"
+            VALUE "ProductVersion", APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

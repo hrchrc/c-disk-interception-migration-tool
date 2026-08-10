@@ -1,0 +1,6 @@
+# 编译配置:向下兼容低配机器
+# target-cpu=x86-64:SSE2 基线(2003 年后所有 x86-64 CPU 支持)
+# 不用 native:避免在现代 CPU 编译的二进制在老 CPU 上 SIGILL 崩溃
+# 不用 x86-64-v2/v3:进一步保证最大兼容性(低配场景优先)
+[build]
+rustflags = ["-C", "target-cpu=x86-64"]
