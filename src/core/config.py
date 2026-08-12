@@ -254,6 +254,9 @@ def setup_logging():
         str(LOG_FILE), when="D", interval=7, backupCount=52, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    # 重复消息限频：相同消息 2 秒内只写一条（解决异步补全/扫描时
+    # [WinError 2] 等同类 DEBUG 异常刷屏 app.log 的问题）
+    fh.addFilter(DuplicateLogFilter(interval=2.0))
     logger.addHandler(fh)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
@@ -262,6 +265,35 @@ def setup_logging():
     _cleanup_old_logs()
     log = logger
     return logger
+
+
+class DuplicateLogFilter(logging.Filter):
+    """重复日志限频过滤器：相同消息在 interval 秒内只放行一次。
+
+    用于 DEBUG 级别高频异常（如异步识别时 WMI/lnk 读取失败反复抛
+    [WinError 2]），保留第一条完整信息，后续相同消息静默丢弃，
+    避免 app.log 被同类日志刷屏。
+    """
+    def __init__(self, interval=2.0):
+        super().__init__()
+        self.interval = interval
+        self._last = {}  # message -> last timestamp
+
+    def filter(self, record):
+        # 只对 DEBUG 级别限频（INFO 及以上的重要消息不限制）
+        if record.levelno > logging.DEBUG:
+            return True
+        key = record.getMessage()
+        now = time.time()
+        last = self._last.get(key, 0)
+        if now - last < self.interval:
+            return False
+        self._last[key] = now
+        # 控制 dict 大小（上限 500 条，防止长运行后内存膨胀）
+        if len(self._last) > 500:
+            self._last = {k: v for k, v in self._last.items()
+                          if now - v < 60}
+        return True
 
 
 def _cleanup_old_logs():
