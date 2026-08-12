@@ -1,4 +1,4 @@
-# C盘拦迁器 (C Disk Interception Migration Tool) v0.03
+# C盘拦迁器 (C Disk Interception Migration Tool) v0.04
 
 监控·拦截·迁移·修复·开发环境配置 全方位守护 C 盘。防止软件在 C 盘创建数据，自动迁移到其他盘符并通过符号链接保持兼容。
 

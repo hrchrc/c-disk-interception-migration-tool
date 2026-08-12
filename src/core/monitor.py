@@ -2010,7 +2010,7 @@ class MonitorWorker(QObject):
             "pythonw.exe",      # 本工具运行进程
             "python.exe",       # 本工具开发模式
             "rust-migrate-engine.exe",  # P6:本工具的 Rust 复制引擎子进程(会写 C 盘数据,不能误杀)
-            "c盘拦迁器",         # 本工具打包后名称（v0.03+）
+            "c盘拦迁器",         # 本工具打包后名称（v0.04+）
             "c盘拦迁器",       # 本工具旧名称（兼容）
             "c-drive-guard",   # 本工具英文名（旧）
             "cdriverelocator",
