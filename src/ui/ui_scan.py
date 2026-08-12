@@ -108,7 +108,7 @@ class ScanHandler:
         _dbg.info(f"[异步补全] 启动线程，待识别 {len(empty_paths)} 个目录")
         from PySide6.QtCore import QThread, Signal
         class DescFillThread(QThread):
-            filled = Signal(str, str)  # path, desc
+            filled_batch = Signal(list)  # [(path, desc), ...] 批量结果（降低跨线程信号频率）
             done = Signal(int)  # count
             error_signal = Signal(str, str)  # path, error
             log_signal = Signal(str)  # 窗口日志输出（实时显示进度）
@@ -161,8 +161,24 @@ class ScanHandler:
                             except Exception:
                                 pass
 
-                    # 4 路并行识别
+                    # 8 路并行识别
                     executor = ThreadPoolExecutor(max_workers=8)
+                    _pending = []  # 批量积累结果，攒够 20 条或 200ms 才 emit 一次
+                    _last_batch_emit = _time.perf_counter()
+
+                    def _flush_pending(force=False):
+                        """积累到阈值或超时后批量发送（force=True 时无条件发送剩余）"""
+                        nonlocal _pending, _last_batch_emit
+                        if not _pending:
+                            _last_batch_emit = _time.perf_counter()
+                            return
+                        now = _time.perf_counter()
+                        if force or len(_pending) >= 20 or (now - _last_batch_emit) >= 0.2:
+                            batch = _pending[:]
+                            _pending.clear()
+                            _last_batch_emit = now
+                            self.filled_batch.emit(batch)
+
                     try:
                         futures = {executor.submit(_identify_one, p): p for p in self.paths}
                         for future in as_completed(futures):
@@ -183,15 +199,16 @@ class ScanHandler:
                             if isinstance(desc, tuple) and desc[0] == "error":
                                 _dbg.error(f"[异步补全] 识别异常 {src_path}: {desc[1]}")
                                 self.error_signal.emit(src_path, str(desc[1]))
-                            elif desc:
-                                if not self._cancel:
-                                    self.filled.emit(src_path, desc)
-                                    _succ += 1
                             else:
-                                # 空字符串：写入 desc_cache 作为"已尝试"标记
+                                # 成功/空结果统一积累，批量 emit（降低主线程信号压力）
                                 if not self._cancel:
-                                    self.filled.emit(src_path, "")
+                                    _pending.append((src_path, desc or ""))
+                                    if desc:
+                                        _succ += 1
+                                    _flush_pending()
                     finally:
+                        # 发送剩余积累结果
+                        _flush_pending(force=True)
                         # 取消所有未开始的 future，不等待正在运行的线程
                         for f in futures:
                             f.cancel()
@@ -261,24 +278,28 @@ class ScanHandler:
                             desc_item.setToolTip(desc)
                 except Exception:
                     continue
-        def on_filled(path, desc):
-            # 更新 scan_cache 和 desc_cache
+        def on_filled_batch(batch):
+            # 批量处理识别结果：写 desc_cache + 更新 scan_cache + 批量刷新表格
             try:
                 if "desc_cache" not in self.cfg:
                     self.cfg["desc_cache"] = {}
-                self.cfg["desc_cache"][path] = desc
-                if not desc:
-                    return
-                # O(1) 查找替代 O(n) 遍历
+                # 构建 path→desc 查找表（一次构建，整批复用）
+                desc_map = {p: d for p, d in batch}
+                # 批量写 desc_cache
+                self.cfg["desc_cache"].update(desc_map)
+                # 批量更新 scan_cache（O(1) 查找）
                 _scan_cache_map = getattr(self, '_scan_cache_map', None)
                 if _scan_cache_map is None:
                     _scan_cache_map = {s.get("path", ""): s for s in self.cfg.get("scan_cache", [])}
                     self._scan_cache_map = _scan_cache_map
-                s = _scan_cache_map.get(path)
-                if s:
-                    s["desc"] = desc
-                # 加入缓冲，延迟批量更新表格
-                _fill_buffer.append((path, desc))
+                for path, desc in batch:
+                    if not desc:
+                        continue
+                    s = _scan_cache_map.get(path)
+                    if s:
+                        s["desc"] = desc
+                # 过滤出有实际描述的结果，加入表格刷新缓冲
+                _fill_buffer.extend((p, d) for p, d in batch if d)
                 nonlocal _fill_timer
                 if len(_fill_buffer) >= _FILL_BATCH_SIZE:
                     if _fill_timer:
@@ -291,7 +312,7 @@ class ScanHandler:
                     _fill_timer.timeout.connect(_flush_fill_buffer)
                     _fill_timer.start(100)
             except Exception as e:
-                _dbg.error(f"[异步补全] on_filled 异常 {path}: {e}")
+                _dbg.error(f"[异步补全] on_filled_batch 异常: {e}")
         def on_done(count):
             try:
                 # 刷新剩余缓冲
@@ -302,7 +323,7 @@ class ScanHandler:
             except Exception as e:
                 _dbg.error(f"[异步补全] on_done 异常: {e}")
         self._desc_fill_thread = DescFillThread(empty_paths)
-        self._desc_fill_thread.filled.connect(on_filled, Qt.QueuedConnection)
+        self._desc_fill_thread.filled_batch.connect(on_filled_batch, Qt.QueuedConnection)
         self._desc_fill_thread.done.connect(on_done, Qt.QueuedConnection)
         self._desc_fill_thread.log_signal.connect(
             lambda msg: self.on_monitor_log("init", msg), Qt.QueuedConnection)
@@ -566,6 +587,8 @@ class ScanHandler:
         # 保存扫描结果到缓存
         self.cfg["scan_cache"] = scanned
         self.cfg["scan_cache_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # scan_cache 重建，重置 O(1) 查找缓存（避免指向旧列表）
+        self._scan_cache_map = None
         save_all(self.cfg)
         # 更新统计标签
         self._update_stats(migrated_count=len(migrated), scan_count=len(scanned))
