@@ -121,10 +121,10 @@ class ScanHandler:
                 self._cancel = True
             def run(self):
                 import time as _time
-                import threading as _threading
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 _t0 = _time.perf_counter()
                 _dbg.info("[异步补全] 线程 run() 进入")
-                self.log_signal.emit(f"[异步补全] 启动：待识别 {len(self.paths)} 个目录（串行+5秒超时）")
+                self.log_signal.emit(f"[异步补全] 启动：待识别 {len(self.paths)} 个目录（4路并行+5秒超时）")
                 # 后台线程使用 win32com（lnk读取、WMI查询）必须初始化COM，否则segfault
                 import pythoncom
                 try:
@@ -135,143 +135,166 @@ class ScanHandler:
                 count = 0
                 _succ = 0
                 _total = len(self.paths)
-                _max_dur = 0.0
-                _max_path = ""
-                _sum_dur = 0.0
                 _timeout_count = 0
+                _timeout_paths = []  # 超时目录路径列表（总结时展示）
                 try:
                     from software_detect import get_dir_description as _gdd
 
-                    def _identify_with_timeout(path, timeout=5.0):
-                        """单条识别 + 超时保护
-                        串行下每条单独起子线程执行，join(timeout) 控制单条最长 5 秒
-                        超时返回空字符串（这条留空，下次扫描时再识别或联网兜底）
+                    def _identify_one(path):
+                        """单条识别（在工作线程中执行，含 COM 初始化）
+                        超时由 ThreadPoolExecutor 的 future.result(timeout=5) 控制
                         """
-                        result = {"desc": "", "error": None}
-                        def _worker():
-                            try:
-                                result["desc"] = _gdd(path)
-                            except BaseException as e:
-                                result["error"] = e
-                        t = _threading.Thread(target=_worker, daemon=True)
-                        t.start()
-                        t.join(timeout)
-                        if t.is_alive():
-                            return None  # 超时
-                        if result["error"]:
-                            raise result["error"]
-                        return result["desc"]
-
-                    for path in self.paths:
-                        # 取消检查（清空缓存时设 _cancel=True，避免回调访问已清空数据）
-                        if self._cancel:
-                            self.log_signal.emit(f"[异步补全] 收到取消请求，剩余 {_total - count} 条跳过")
-                            _dbg.info(f"[异步补全] 收到取消，已处理 {count}/{_total}")
-                            break
-                        _t_start = _time.perf_counter()
+                        import pythoncom as _pcm
                         try:
-                            desc = _identify_with_timeout(path, timeout=5.0)
-                            _dur = _time.perf_counter() - _t_start
-                            count += 1
-                            _sum_dur += _dur
-                            if _dur > _max_dur:
-                                _max_dur = _dur
-                                _max_path = path
-                            if desc is None:
-                                _timeout_count += 1
-                                _dbg.warning(f"[异步补全] 单条超时 (>5s): {path}")
-                                self.log_signal.emit(
-                                    f"[异步补全] 超时跳过 ({count}/{_total}): {path}")
-                            else:
-                                if desc:
-                                    # 再次检查取消（5秒超时期间可能已收到取消）
-                                    if self._cancel:
-                                        self.log_signal.emit(f"[异步补全] 取消，丢弃最后一条结果")
-                                        break
-                                    self.filled.emit(path, desc)
-                                    _succ += 1
-                                else:
-                                    # 识别返回空字符串（无法识别）：
-                                    # 也 emit filled 写入 desc_cache（空字符串作为"已尝试"标记），
-                                    # 避免下次启动重复识别同样的无法识别目录
-                                    if not self._cancel:
-                                        self.filled.emit(path, "")
-                            # 每 10 条或最后一条输出进度
-                            if count % 10 == 0 or count == _total:
-                                _avg = _sum_dur / count
-                                self.log_signal.emit(
-                                    f"[异步补全] 进度 {count}/{_total} - "
-                                    f"累计 {_sum_dur:.1f}s 平均 {_avg*1000:.0f}ms/条"
-                                    f" 最慢 {_max_dur*1000:.0f}ms"
-                                    f" 超时 {_timeout_count}")
+                            _pcm.CoInitialize()
+                        except BaseException:
+                            pass
+                        try:
+                            desc = _gdd(path)
+                            # _gdd 可能返回 None（未识别），统一转为空字符串
+                            return path, (desc or "")
                         except BaseException as e:
-                            import traceback
-                            _dbg.error(f"[异步补全] 识别异常 {path}: {e}\n{traceback.format_exc()}")
-                            self.error_signal.emit(path, str(e))
+                            return path, ("error", e)
+                        finally:
+                            try:
+                                _pcm.CoUninitialize()
+                            except Exception:
+                                pass
+
+                    # 4 路并行识别
+                    executor = ThreadPoolExecutor(max_workers=4)
+                    try:
+                        futures = {executor.submit(_identify_one, p): p for p in self.paths}
+                        for future in as_completed(futures):
+                            if self._cancel:
+                                break
+                            path = futures[future]
+                            try:
+                                # 单条超时 5 秒（替代原来的子线程 join 模式）
+                                src_path, desc = future.result(timeout=5.0)
+                            except Exception as e:
+                                # TimeoutError 或其他异常
+                                _timeout_count += 1
+                                _timeout_paths.append(path)
+                                _dbg.warning(f"[异步补全] 单条超时/异常 (>5s): {path}: {e}")
+                                count += 1
+                                continue
                             count += 1
-                    _elapsed = _time.perf_counter() - _t0
-                    _avg = _sum_dur / count if count else 0
-                    _summary = (f"[异步补全] 完成：{_succ}/{_total} 成功 - "
-                                f"总耗时 {_elapsed:.2f}s（串行墙钟）"
-                                f" 累计 CPU {_sum_dur:.2f}s 平均 {_avg*1000:.0f}ms/条"
-                                f" 最慢 {_max_dur*1000:.0f}ms"
-                                f" 超时 {_timeout_count} 条")
-                    self.log_signal.emit(_summary)
-                    _dbg.info(f"[异步补全] 线程完成，成功 {_succ}/{_total}, 耗时 {_elapsed:.2f}s")
-                    self.done.emit(count)
+                            if isinstance(desc, tuple) and desc[0] == "error":
+                                _dbg.error(f"[异步补全] 识别异常 {src_path}: {desc[1]}")
+                                self.error_signal.emit(src_path, str(desc[1]))
+                            elif desc:
+                                if not self._cancel:
+                                    self.filled.emit(src_path, desc)
+                                    _succ += 1
+                            else:
+                                # 空字符串：写入 desc_cache 作为"已尝试"标记
+                                if not self._cancel:
+                                    self.filled.emit(src_path, "")
+                    finally:
+                        # 取消所有未开始的 future，不等待正在运行的线程
+                        for f in futures:
+                            f.cancel()
+                        executor.shutdown(wait=False)
                 except BaseException as e:
                     import traceback
                     _dbg.error(f"[异步补全] 线程级异常: {e}\n{traceback.format_exc()}")
-                    self.done.emit(count)
                 finally:
                     try:
                         pythoncom.CoUninitialize()
                     except Exception as e:
                         log.debug("忽略异常: %s", e)
+                _elapsed = _time.perf_counter() - _t0
+                # 总结：只发一条，包含超时目录路径
+                if _timeout_paths:
+                    timeout_list = "\n".join(f"    • {p}" for p in _timeout_paths[:10])
+                    if len(_timeout_paths) > 10:
+                        timeout_list += f"\n    ... 还有 {len(_timeout_paths) - 10} 个超时目录未显示"
+                    _summary = (f"[异步补全] 完成：{_succ}/{_total} 成功 - "
+                                f"总耗时 {_elapsed:.2f}s - "
+                                f"超时 {_timeout_count} 个目录：\n{timeout_list}")
+                else:
+                    _summary = (f"[异步补全] 完成：{_succ}/{_total} 成功 - "
+                                f"总耗时 {_elapsed:.2f}s ✓")
+                self.log_signal.emit(_summary)
+                _dbg.info(f"[异步补全] 线程完成，成功 {_succ}/{_total}, 耗时 {_elapsed:.2f}s")
+                self.done.emit(count)
+        # 批量更新缓冲：积累 filled 结果，通过 QTimer 延迟批量刷新表格
+        # 避免每条结果都遍历全表（N 行 × M 次回调 = N*M 次遍历）
+        _fill_buffer = []  # [(path, desc), ...]
+        _fill_timer = None
+        _FILL_BATCH_SIZE = 8  # 攒够 8 条或 100ms 超时就刷新
+
+        def _flush_fill_buffer():
+            nonlocal _fill_buffer, _fill_timer
+            _fill_timer = None
+            if not _fill_buffer:
+                return
+            batch = _fill_buffer[:]
+            _fill_buffer.clear()
+            # 构建 path→desc 查找表
+            desc_map = {p: d for p, d in batch}
+            # 一次性遍历表格，更新所有匹配行
+            row_count = self.table_scan.rowCount()
+            import re as _re_fill
+            from utils import is_system_path
+            for row in range(row_count):
+                try:
+                    path_item = self.table_scan.item(row, 0)
+                    if not path_item:
+                        continue
+                    path = path_item.text()
+                    if path not in desc_map:
+                        continue
+                    desc = desc_map[path]
+                    if not desc:
+                        continue
+                    desc_item = self.table_scan.item(row, 4)
+                    if desc_item:
+                        cur_text = desc_item.text() or ""
+                        cur_clean = _re_fill.sub(r'^\[[^\]]*\]\s*', '', cur_text).strip()
+                        if not cur_clean:
+                            if is_system_path(path):
+                                desc_item.setText("[系统] " + desc)
+                            else:
+                                desc_item.setText(desc)
+                            desc_item.setToolTip(desc)
+                except Exception:
+                    continue
         def on_filled(path, desc):
             # 更新 scan_cache 和 desc_cache
             try:
-                # desc_cache 始终写入（空字符串也写，作为"已尝试识别"标记）
                 if "desc_cache" not in self.cfg:
                     self.cfg["desc_cache"] = {}
                 self.cfg["desc_cache"][path] = desc
-                # 空字符串不更新 scan_cache 和表格（保持空，留给联网搜索兜底）
                 if not desc:
                     return
                 for s in self.cfg.get("scan_cache", []):
                     if s.get("path") == path:
                         s["desc"] = desc
                         break
-                # 更新表格（基于路径匹配，加防护避免表格被刷新重建时访问无效item）
-                row_count = self.table_scan.rowCount()
-                for row in range(row_count):
-                    try:
-                        path_item = self.table_scan.item(row, 0)
-                        if path_item and path_item.text() == path:
-                            desc_item = self.table_scan.item(row, 4)
-                            if desc_item:
-                                # 去掉所有 [xxx] 前缀后判断是否为空（[~] [?] [系统] 都视为待填充）
-                                import re as _re_fill
-                                cur_text = desc_item.text() or ""
-                                cur_clean = _re_fill.sub(r'^\[[^\]]*\]\s*', '', cur_text).strip()
-                                if not cur_clean:
-                                    # 保留系统文件的 [系统] 前缀
-                                    from utils import is_system_path
-                                    if is_system_path(path):
-                                        desc_item.setText("[系统] " + desc)
-                                    else:
-                                        desc_item.setText(desc)
-                                    desc_item.setToolTip(desc)
-                            break
-                    except Exception:
-                        break  # 表格正在被重建，放弃本次更新
+                # 加入缓冲，延迟批量更新表格
+                _fill_buffer.append((path, desc))
+                nonlocal _fill_timer
+                if len(_fill_buffer) >= _FILL_BATCH_SIZE:
+                    if _fill_timer:
+                        _fill_timer.stop()
+                    _flush_fill_buffer()
+                elif _fill_timer is None:
+                    from PySide6.QtCore import QTimer as _QTimer
+                    _fill_timer = _QTimer(self)
+                    _fill_timer.setSingleShot(True)
+                    _fill_timer.timeout.connect(_flush_fill_buffer)
+                    _fill_timer.start(100)
             except Exception as e:
                 _dbg.error(f"[异步补全] on_filled 异常 {path}: {e}")
         def on_done(count):
             try:
+                # 刷新剩余缓冲
+                if _fill_buffer:
+                    _flush_fill_buffer()
                 save_all(self.cfg)
-                self.on_monitor_log("init", f"异步补全完成: 处理 {count} 个目录（成功识别的已写入说明，无法识别的已标记跳过）")
-                _dbg.info(f"[异步补全] on_done 完成，保存配置")
+                _dbg.info(f"[异步补全] on_done 完成，保存配置（处理 {count} 个目录）")
             except Exception as e:
                 _dbg.error(f"[异步补全] on_done 异常: {e}")
         self._desc_fill_thread = DescFillThread(empty_paths)

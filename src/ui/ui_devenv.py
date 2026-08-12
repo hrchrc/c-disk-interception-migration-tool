@@ -1547,7 +1547,7 @@ class DevEnvHandler:
 
         worker.finished_signal.connect(_on_migrated_done)
         worker.progress_signal.connect(_on_apply_progress)
-        worker.verbose_log_sig.connect(self.on_monitor_log, Qt.QueuedConnection)
+        worker.verbose_log_sig.connect(self._log_monitor, Qt.QueuedConnection)
         worker.error_signal.connect(lambda e: (
             self.btn_apply_migrated.setEnabled(True),
             self.btn_apply_dev.setEnabled(True),
@@ -1883,7 +1883,7 @@ class DevEnvHandler:
 
         worker.finished_signal.connect(_on_done)
         worker.progress_signal.connect(_on_apply_progress2)
-        worker.verbose_log_sig.connect(self.on_monitor_log, Qt.QueuedConnection)
+        worker.verbose_log_sig.connect(self._log_monitor, Qt.QueuedConnection)
         worker.error_signal.connect(_on_error)
         worker.start()
 
@@ -2734,7 +2734,7 @@ class DevEnvHandler:
             restore_worker = _RestoreDataWorker(tool_pairs, self.migrator, self.cfg)
             self._dev_env_restore_worker = restore_worker
             # 开发工具迁移区专用：migrator 阶段日志转发到监控日志
-            restore_worker.verbose_log_sig.connect(self.on_monitor_log, Qt.QueuedConnection)
+            restore_worker.verbose_log_sig.connect(self._log_monitor, Qt.QueuedConnection)
 
             # 显示进度条
             self.progress.setVisible(True)
@@ -3096,7 +3096,7 @@ class DevEnvHandler:
 
         worker.finished_signal.connect(_on_done)
         worker.progress_signal.connect(lambda c, t, m: self.on_monitor_log("dev_env", m))
-        worker.verbose_log_sig.connect(self.on_monitor_log, Qt.QueuedConnection)
+        worker.verbose_log_sig.connect(self._log_monitor, Qt.QueuedConnection)
         worker.error_signal.connect(_on_error)
         worker.start()
 

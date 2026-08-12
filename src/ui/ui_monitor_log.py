@@ -135,17 +135,69 @@ class MonitorLogHandler:
                 log.debug("忽略异常: %s", e)
         except Exception as e:
             log.debug("忽略异常: %s", e)
-        # UI 渲染限频：距上次渲染 > 500ms 才重绘，否则延迟到下次
+        self._schedule_log_render()
+
+    def on_monitor_log_accumulate(self, event_type, key, message):
+        """累加日志：相同 event_type+key 的消息原地更新，不新增行。
+
+        用于高频进度消息（如复制进度、异步补全进度），避免日志刷屏。
+        - 如果 cache 最后一条的 event_type 和 accumulate key 匹配，替换其内容
+        - 否则新增一条
+        - 日志文件始终追加写（保留完整审计轨迹）
+        """
+        full_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        from i18n import tr
+        # 检查 cache 最后一条是否匹配（原地更新）
+        accumulate_key = f"__accumulate__:{key}"
+        if self._monitor_log_cache:
+            last_ts, last_et, last_msg = self._monitor_log_cache[-1]
+            if last_et == accumulate_key:
+                # 原地更新：替换时间戳和消息内容，event_type 保持 accumulate 标记
+                self._monitor_log_cache[-1] = (full_ts, accumulate_key, message)
+                # 状态栏更新
+                self.status_label.setText(tr(message))
+                # 日志文件追加（审计用）
+                try:
+                    safe_msg = message.replace("\r\n", " ⏎ ").replace("\n", " ⏎ ").replace("\r", " ⏎ ")
+                    with open(MONITOR_LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"[{full_ts}] [{event_type}] {safe_msg}\n")
+                    try:
+                        from config import rotate_log_if_needed
+                        rotate_log_if_needed(MONITOR_LOG_FILE)
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
+                self._schedule_log_render()
+                return
+        # 首次：新增一条，event_type 用 accumulate 标记
+        self._monitor_log_cache.append((full_ts, accumulate_key, message))
+        if len(self._monitor_log_cache) > 1000:
+            self._monitor_log_cache = self._monitor_log_cache[-1000:]
+        self.status_label.setText(tr(message))
+        try:
+            safe_msg = message.replace("\r\n", " ⏎ ").replace("\n", " ⏎ ").replace("\r", " ⏎ ")
+            with open(MONITOR_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{full_ts}] [{event_type}] {safe_msg}\n")
+            try:
+                from config import rotate_log_if_needed
+                rotate_log_if_needed(MONITOR_LOG_FILE)
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
+        self._schedule_log_render()
+
+    def _schedule_log_render(self):
+        """UI 渲染限频：距上次渲染 > 500ms 才重绘，否则延迟到下次"""
         import time as _time
         now = _time.time()
         last = getattr(self, "_last_log_render_ts", 0)
         if now - last >= 0.5:
             self._render_monitor_log()
             self._last_log_render_ts = now
-            # 如果有待渲染的日志，用 QTimer 安排下一次渲染
             self._log_render_pending = False
         else:
-            # 标记有待渲染，用单次 QTimer 在 500ms 后渲染
             if not getattr(self, "_log_render_pending", False):
                 self._log_render_pending = True
                 from PySide6.QtCore import QTimer
@@ -234,7 +286,8 @@ class MonitorLogHandler:
             filter_type = self._FILTER_MAP.get(filter_text)
             # 按筛选条件过滤
             if filter_type:
-                entries = [e for e in self._monitor_log_cache if e[1] == filter_type]
+                entries = [e for e in self._monitor_log_cache
+                           if e[1] == filter_type or e[1].startswith(f"__accumulate__:") and e[1].split(":", 2)[1] == filter_type]
             else:
                 entries = self._monitor_log_cache
             # 渲染
@@ -242,12 +295,20 @@ class MonitorLogHandler:
             self.log_text.clear()
             for full_ts, etype, msg in entries:
                 # 显示完整年月日时分秒（不再截断为时分秒）
-                label, color = self._LOG_TYPE_MAP.get(etype, (etype, "#424242"))
+                # 累加日志：从 key 中提取原始 event_type 用于标签/颜色匹配
+                if etype.startswith("__accumulate__:"):
+                    parts = etype.split(":", 2)
+                    real_etype = parts[1] if len(parts) > 1 else "init"
+                else:
+                    real_etype = etype
+                label, color = self._LOG_TYPE_MAP.get(real_etype, (real_etype, "#424242"))
                 # 渲染时翻译（cache 存原文：切换语言后重新渲染即新语言；
                 # tr 有缓存，限频渲染下开销可忽略）
                 display = tr(str(msg))
                 # 转义 msg 中的 HTML 特殊字符，防止路径/进程名含 <>& 破坏渲染
                 safe_msg = _html.escape(display)
+                # 多行消息：把 \n 转为 <br> 让 HTML 正确换行
+                safe_msg = safe_msg.replace("\n", "<br>")
                 self.log_text.append(
                     f'<span style="color:#757575">[{full_ts}]</span> '
                     f'<span style="color:{color};font-weight:bold">[{label}]</span> '
@@ -465,9 +526,28 @@ class MonitorLogHandler:
                 f"on_installer_confirm: {name} PID:{pid}")
 
     def _log_monitor(self, event_type, message):
-        """向监控日志发消息（主线程安全）"""
+        """向监控日志发消息（主线程安全）
+
+        支持累加模式：event_type 以 "accumulate:" 前缀开头时，
+        自动路由到 on_monitor_log_accumulate，原地更新相同 key 的日志行。
+        格式：accumulate:<real_event_type>:<accumulate_key>
+        """
         try:
-            self.on_monitor_log(event_type, message)
+            if event_type.startswith("accumulate:"):
+                # 解析 accumulate:migrate:copy_progress → event_type=migrate, key=copy_progress
+                parts = event_type.split(":", 2)
+                real_etype = parts[1] if len(parts) > 1 else "init"
+                acc_key = parts[2] if len(parts) > 2 else "default"
+                self.on_monitor_log_accumulate(real_etype, acc_key, message)
+            else:
+                self.on_monitor_log(event_type, message)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
+
+    def _log_monitor_accumulate(self, event_type, key, message):
+        """向监控日志发累加消息（相同 key 原地更新，不新增行）"""
+        try:
+            self.on_monitor_log_accumulate(event_type, key, message)
         except Exception as e:
             log.debug("忽略异常: %s", e)
 

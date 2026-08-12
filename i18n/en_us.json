@@ -6579,6 +6579,15 @@
     "不再提醒": "Stop Notifying",
     "检测到用户目录 ~ 下新建目录：\n~\n\n可在待迁移区查看并迁移，或点击气泡\"不再提醒\"关闭": "New directory detected under user folder ~:\n~\n\nView and migrate it in the Pending Migration tab, or click \"Stop Notifying\" to disable",
     "监控当前用户目录下新建目录，右下角气泡提醒（只提醒不拦截）。\nAI 工具/开发工具常往用户目录写缓存数据，提醒可及时发现膨胀。\n气泡上点'不再提醒'也会关闭此开关。": "Monitors new folders created under the current user folder and shows a corner bubble (notify only, no interception).\nAI/dev tools often write caches to the user folder - alerts help you catch growth early.\nClicking 'Stop Notifying' on the bubble also disables this switch.",
-    "用户目录新建目录: ~": "New folder created under user folder: ~"
+    "用户目录新建目录: ~": "New folder created under user folder: ~",
+    "  📦 已复制 ~ 个文件（~s，~ 文件/秒）...": "  📦 Copied ~ files (~s, ~ files/s)...",
+    "  📦 ~完成：共复制 ~ 个文件（耗时 ~s）✓": "  📦 ~ complete: copied ~ files (took ~s) ✓",
+    "  📦 ~完成：共复制 ~ 个文件（耗时 ~s）  ⚠ ~ 个文件失败：": "  📦 ~ complete: copied ~ files (took ~s)  ⚠ ~ files failed:",
+    "    ... 还有 ~ 个失败文件未显示": "    ... ~ more failed files not shown",
+    "  ⏹ ~已取消，未完成": "  ⏹ ~ cancelled, incomplete",
+    "[异步补全] 完成：~/~ 成功 - 总耗时 ~s ✓": "[Async Completion] complete: ~/~ succeeded - took ~s ✓",
+    "[异步补全] 完成：~/~ 成功 - 总耗时 ~s - 超时 ~ 个目录：": "[Async Completion] complete: ~/~ succeeded - took ~s - ~ directories timed out:",
+    "    ... 还有 ~ 个超时目录未显示": "    ... ~ more timed-out directories not shown",
+    "[异步补全] 启动：待识别 ~ 个目录（~路并行+~秒超时）": "[Async Completion] start: ~ directories to recognize (~-way parallel, ~s timeout)"
   }
 }

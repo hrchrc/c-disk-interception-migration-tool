@@ -1,4 +1,4 @@
-# ===== 本地配置/日志/缓存（含运行时数据，不上传） =====
+# ===== 本地配置/日志/缓存 =====
 config.json
 ai_keys.json
 state.json
@@ -6,12 +6,7 @@ logs/
 backup/
 /data/
 dev_env_snapshots/
-识别记录.json
 *.log
-# 本地启动脚本（开发期辅助，打包 exe 后无需）
-*.bat
-# Python 升级脚本（含本地用户名路径，不上传）
-upgrade_python_*.ps1
 
 # ===== PyInstaller 构建产物 =====
 build/
@@ -41,10 +36,10 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# ===== 本地文档（私人，不上传） =====
+# ===== 本地文档=====
 *.docx
 
-# ===== 数据生成中间产物（私人，不上传） =====
+# ===== 数据生成中间产物 =====
 _china_sw_expand/
 winget-tmp/
 scoop-proxy-cn-sync/
@@ -53,13 +48,13 @@ scoop-proxy-cn-sync.zip
 *.backup_*
 *.bak_*
 
-# ===== 开发期临时测试/诊断脚本（含本地路径，不上传） =====
+# ===== 开发期临时测试/诊断脚本=====
 src/_*.ps1
 src/tests/data/
 src/tests/logs/
 
 
-# ===== Rust 构建产物（曾导致 git 未跟踪列表被数万个文件刷屏） =====
+# ===== Rust 构建产物=====
 rust-engine/target/
 
 # ===== 发布补充清单实测遗漏项 =====

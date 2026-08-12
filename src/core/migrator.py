@@ -289,7 +289,7 @@ _FORBIDDEN_RD_PATHS = frozenset([
     r"C:\USERS", r"C:\RECOVERY", r"C:\SYSTEM VOLUME INFORMATION",
 ])
 # C:\WINDOWS 整棵子树(SYSTEM32 等)也拒绝;其余关键路径只精确拒绝本身,
-# 不误伤其子目录(C:\Users\xxx\... 是正常迁移范围)。
+# 不误伤其子目录(C:\Users\aaa\... 是正常迁移范围)。
 _FORBIDDEN_RD_PREFIXES = (r"C:\WINDOWS",)
 
 # Restart Manager (rstrtmgr.dll) 句柄模块级缓存(P6 审查修复):
@@ -1029,6 +1029,7 @@ class Migrator:
         start_time = time.time()
         first_err = None  # (code, reason, suggestion, file) 取第一个 file_error
         cancelled_by_engine = False
+        file_errors = []  # 所有 file_error 事件（用于完成时摘出失败文件）
 
         def on_event(evt):
             nonlocal file_count, last_report, first_err, cancelled_by_engine
@@ -1042,18 +1043,23 @@ class Migrator:
                     elapsed = now - start_time
                     rate = evt.get("rate_fps",
                                    files_done / elapsed if elapsed > 0 else 0)
-                    self._emit_log("migrate",
+                    # 累加模式：相同 accumulate key 原地更新，不新增日志行
+                    self._emit_log("accumulate:migrate:copy_progress",
                         f"  📦 已复制 {files_done} 个文件（{elapsed:.1f}s，{rate:.1f} 文件/秒）...")
                     last_report = files_done
             elif event == "file_error":
                 # 取第一个错误作为主诊断(与原复制路径 first_err 逻辑一致)
+                err_path = evt.get("path", "")
+                err_reason = evt.get("reason", "未知错误")
                 if first_err is None:
                     first_err = (
                         evt.get("code", 0),
-                        evt.get("reason", "未知错误"),
+                        err_reason,
                         evt.get("suggestion", "请查看日志或重试"),
-                        evt.get("path", ""),
+                        err_path,
                     )
+                # 收集所有失败文件（完成时摘出展示）
+                file_errors.append((err_path, err_reason))
             elif event == "info" and evt.get("key") == "fast_move":
                 # P9:同卷快速移动(原子重命名,零复制)完成/回退事件
                 val = evt.get("value", "")
@@ -1154,8 +1160,19 @@ class Migrator:
         # 最后一次进度汇报(确保用户看到最终文件数)
         if file_count > 0:
             elapsed = time.time() - start_time
-            self._emit_log("migrate",
-                f"  📦 {action_label}完成：共复制 {file_count} 个文件（耗时 {elapsed:.1f}s）")
+            if file_errors:
+                # 有失败文件：在完成行中摘出失败文件路径和原因
+                err_summary = "\n".join(
+                    f"    • {os.path.basename(p) if p else '?'} — {r}"
+                    for p, r in file_errors[:10])
+                if len(file_errors) > 10:
+                    err_summary += f"\n    ... 还有 {len(file_errors) - 10} 个失败文件未显示"
+                self._emit_log("migrate",
+                    f"  📦 {action_label}完成：共复制 {file_count} 个文件（耗时 {elapsed:.1f}s）"
+                    f"  ⚠ {len(file_errors)} 个文件失败：\n{err_summary}")
+            else:
+                self._emit_log("migrate",
+                    f"  📦 {action_label}完成：共复制 {file_count} 个文件（耗时 {elapsed:.1f}s）✓")
 
         # 填充失败诊断(引擎 rc>=8 但未 raise 的场景,如 rc=8 无 stderr)
         if first_err:
@@ -4255,7 +4272,7 @@ class Migrator:
                     if not is_symlink(full_path):
                         continue
                     # 只补录符号链接（本工具迁移产物，_create_dir_link /D 优先）
-                    # 过滤 junction：手动建的目录联接等和
+                    # 过滤 junction：手动建的目录联接（.hermes → G:\AI\... 等）和
                     # 系统 XP 兼容链接都不是本工具迁移产物，补录会干扰用户选择
                     # （用户可能误点"还原"把目标盘数据复制回 C 盘）
                     if is_junction(full_path):
