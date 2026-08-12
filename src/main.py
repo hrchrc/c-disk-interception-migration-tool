@@ -114,7 +114,7 @@ from ui_migrate import MigrateHandler
 from ui_monitor_log import MonitorLogHandler
 from ui_lifecycle import LifecycleHandler
 from ui_widgets import (
-    NumericTableWidgetItem, WideEditorDelegate,
+    NumericTableWidgetItem, WideEditorDelegate, NoElideDelegate,
     _format_size, _apply_size_item_color,
 )
 from ui_workers import (
@@ -470,6 +470,13 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
             on_done_callback=_on_recover_done))
         self._start_monitor()
         log.info("监控启动完成")
+        # 后台构建已迁移目标目录轻量索引（跨盘校对值，防删除记录/恢复卡顿）
+        # 只对 MFT 未覆盖的跨盘目标 os.walk 构建，后台线程执行不卡 UI
+        try:
+            threading.Thread(
+                target=self.migrator.build_all_dst_indexes, daemon=True).start()
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         self._setup_tray()
         log.info("托盘设置完成")
         # 启动时加载缓存，不重新扫描
@@ -612,6 +619,15 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
             "默认 50MB。值越小告警越频繁，值越大只关注大目录。\n")
         opt_row.addWidget(self.edit_threshold)
         opt_row.addSpacing(10)
+        # 用户目录写入提醒（右下角气泡开关；气泡上点"不再提醒"也会关闭它）
+        self.chk_user_dir_notify = QCheckBox("用户目录写入提醒")
+        self.chk_user_dir_notify.setChecked(self.cfg.get("user_dir_notify_enabled", True))
+        self.chk_user_dir_notify.setToolTip(
+            "监控当前用户目录下新建目录，右下角气泡提醒（只提醒不拦截）。\n"
+            "AI 工具/开发工具常往用户目录写缓存数据，提醒可及时发现膨胀。\n"
+            "气泡上点'不再提醒'也会关闭此开关。")
+        opt_row.addWidget(self.chk_user_dir_notify)
+        opt_row.addSpacing(10)
         # 复制选项:P5 用户可选(哈希校验开关 + 线程数),避免冷盘校验太慢
         self.chk_verify = QCheckBox("复制校验")
         self.chk_verify.setChecked(self.cfg.get("verify_hash", True))
@@ -720,14 +736,17 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         # 每列最小列宽100px（防止拖太窄直接变三个点）
         header_m.setMinimumSectionSize(100)
         header_m.setDefaultSectionSize(120)
-        header_m.resizeSection(0, 300)
-        header_m.resizeSection(1, 200)
+        header_m.resizeSection(0, 420)  # C盘路径（加宽：路径完整显示更久才到边界）
+        header_m.resizeSection(1, 420)  # 目标盘（原200太窄，显示28字符就出三点）
         header_m.resizeSection(2, 100)
         header_m.resizeSection(3, 120)
-        header_m.resizeSection(4, 220)
+        header_m.resizeSection(4, 400)  # 目标路径（路径列，同步加宽）
         header_m.resizeSection(5, 200)
         header_m.resizeSection(6, 150)
-        self.table_migrated.setTextElideMode(Qt.ElideRight)
+        # 去省略号：view.setTextElideMode 在本环境渲染不生效，
+        # 用 NoElideDelegate 从绘制层强制无"..."（实测有效）
+        self.table_migrated.setTextElideMode(Qt.ElideNone)
+        self.table_migrated.setItemDelegate(NoElideDelegate(self.table_migrated))
         self.table_migrated.setWordWrap(False)
         self.table_migrated.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_migrated.setSelectionMode(QTableWidget.ExtendedSelection)
@@ -819,13 +838,14 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         header_s.setMinimumSectionSize(100)
         header_s.setDefaultSectionSize(120)
         # 设置默认列宽
-        header_s.resizeSection(0, 300)  # C盘路径
+        header_s.resizeSection(0, 420)  # C盘路径（加宽：路径显示更久才到边界）
         header_s.resizeSection(1, 100)  # 位置
         header_s.resizeSection(2, 140)  # 大小（加宽显示KB/MB单位）
         header_s.resizeSection(3, 150)  # 目录名
         header_s.resizeSection(4, 420)  # 说明（加宽，长说明也能显示完整）
-        # 拖窄时用右边省略号显示（部分文字+...）
-        self.table_scan.setTextElideMode(Qt.ElideRight)
+        # 去省略号：NoElideDelegate 绘制层强制无"..."（实测有效）
+        self.table_scan.setTextElideMode(Qt.ElideNone)
+        self.table_scan.setItemDelegate(NoElideDelegate(self.table_scan))
         self.table_scan.setWordWrap(False)
         self.table_scan.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_scan.setSelectionMode(QTableWidget.ExtendedSelection)  # 支持多选
@@ -938,7 +958,7 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 
 <h3>一、快速上手（5 步完成首次迁移）</h3>
 <ol>
-<li><b>启动扫描</b>：程序启动后自动建立 MFT 全盘索引（数秒完成）并扫描 C 盘 6 个关键目录，扫描进度在底部状态栏显示</li>
+<li><b>启动扫描</b>：程序启动后自动建立 MFT 全盘索引（数秒完成）并扫描 C 盘 6 个关键目录 + 当前用户目录，扫描进度在底部状态栏显示</li>
 <li><b>查看占用</b>：切换到"待迁移"标签页，点击"大小"列标题按从大到小排序，快速定位占空间的目录</li>
 <li><b>选择迁移</b>：勾选要迁移的目录（可按 Ctrl/Shift 多选），右键选"迁移到默认盘"或"迁移到指定位置"</li>
 <li><b>自动完成</b>：程序自动把数据复制到目标盘 → 删除 C 盘原目录 → 在原位置创建符号链接，全程无需关闭软件</li>
@@ -947,9 +967,9 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <p><b>提示</b>：迁移不影响软件运行，符号链接对软件完全透明，照常读写数据。建议以管理员身份运行以获得完整权限。</p>
 
 <h3>二、待迁移标签页</h3>
-<p>列出 C 盘 6 个关键目录下的一级子目录及大小，自动识别每个目录对应的软件名称。</p>
+<p>列出 C 盘 6 个关键目录 + 当前用户目录下的一级子目录及大小，自动识别每个目录对应的软件名称。</p>
 
-<p><b>扫描范围（6 个关键目录）</b>：</p>
+<p><b>扫描范围（6 个关键目录 + 当前用户目录）</b>：</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><td>%LocalAppData%</td><td>本地应用数据（用户级，不随登录漫游）</td></tr>
 <tr><td>%LocalAppData%\Programs</td><td>本地安装的程序（用户级，免管理员）</td></tr>
@@ -957,8 +977,11 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <tr><td>C:\Program Files</td><td>64 位系统级程序</td></tr>
 <tr><td>C:\Program Files (x86)</td><td>32 位系统级程序</td></tr>
 <tr><td>C:\ProgramData</td><td>系统级程序共享数据（所有用户共用）</td></tr>
+<tr><td>%UserProfile%</td><td>当前用户目录（AI 工具/开发工具缓存等），自动排除已监控的 AppData 子目录与桌面/文档/下载等系统文件夹</td></tr>
 </table>
-<p><b>说明</b>：只扫描这 6 个目录下的一级子目录，不递归扫描孙目录，保证扫描速度。</p>
+<p><b>说明</b>：只扫描这些目录下的一级子目录，不递归扫描孙目录，保证扫描速度。</p>
+
+<p><b>用户目录写入提醒</b>：当前用户目录下新建目录时，右下角弹出气泡提醒（只提醒不拦截，软件内小窗，约 10 秒自动淡出）。可在气泡上点"不再提醒"，或通过工具栏「用户目录写入提醒」开关关闭/重新开启。</p>
 
 <p><b>大小显示规则</b>：</p>
 <ul>
@@ -1007,6 +1030,8 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <li><b>刷新已迁移按钮</b>：重新检测所有链接状态和目标盘目录大小</li>
 <li><b>后台自动检查</b>：每隔 60 秒自动检测一次链接状态，发现异常会在监控日志记录</li>
 </ul>
+
+<p><b>链接类型</b>：只显示本工具创建的符号链接。手动/系统创建的目录联接（junction）不会出现在此表，避免误操作（对 junction 点"还原"会把目标盘数据复制回 C 盘，破坏手动布局）。</p>
 
 <h3>四、开发环境迁移标签页</h3>
 <p>专为开发者设计的配置迁移工具，支持 30+ 种开发工具（npm/pip/cargo/gradle/Android SDK 等），一键把工具的全局包目录、缓存目录、环境变量迁移到目标盘，并自动配置好所有相关环境变量和配置文件。</p>
@@ -1219,7 +1244,7 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <p><b>说明</b>：白名单匹配进程名（不区分大小写），不含路径。建议把常用软件的更新程序加入白名单避免误杀。</p>
 
 <h3>十二、系统文件保护</h3>
-<p>程序内置系统文件识别，覆盖 20 种系统路径前缀和 7 个关键词（如 system32、drivers 等）。</p>
+<p>程序内置系统文件识别：20 种系统路径前缀（Program Files / ProgramData 下的系统组件，如 Microsoft、WindowsApps、Common Files 等）+ 安全软件关键词（Windows Defender、Windows Security、WindowsApps）。用户级缓存（如 AppData\Local\Microsoft\Windows 下的 INetCache）与软件缓存/模拟目录（如 .wine 的 system32）不再误标 [系统]，可直接迁移。</p>
 <p><b>识别后表现</b>：</p>
 <ul>
 <li>待迁移表中整行涂橙色背景，说明列加 [系统] 前缀</li>
@@ -1298,7 +1323,8 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <p><b>Q：清空缓存后 API Key 会丢失吗？</b><br>A：不会。API Key 独立存储在 ai_keys.json 文件（与 config.json 分离），清空缓存只删除扫描结果和识别缓存，不影响 API Key。清空缓存后无需重新配置 AI。</p>
 <p><b>Q：为什么有些目录识别为"笼统说明"？</b><br>A：部分目录（如 Microsoft 公共组件）无法精确识别到具体产品，会返回笼统说明。可双击手动编辑或联网补全。</p>
 <p><b>Q：管理员权限有什么用？</b><br>A：创建符号链接、删除系统目录、拦截进程都需要管理员权限。建议以管理员身份运行以获得完整功能。</p>
-<p><b>Q：支持哪些目标盘？</b><br>A：支持本地硬盘、U盘、移动硬盘。但建议用固定盘（如 D/E/F/G 盘），移动设备拔出后链接会失效。</p>
+<p><b>Q：支持哪些目标盘？</b><br>A：支持本地硬盘、U盘、移动硬盘。但建议用固定盘（如 D/E/F/G 盘），移动设备拔出后链接会失效。目标盘为 FAT32/exFAT 时，环境诊断会给出警告（FAT32 单文件最大 4GB，大文件迁移会失败；exFAT 无 NTFS 的 ACL/硬链接/稀疏文件支持，部分属性会丢失），建议使用 NTFS 格式的磁盘。</p>
+<p><b>Q：目录里有 OneDrive 等云盘占位文件能迁移吗？</b><br>A：可以，但迁移会触发这些文件从云端下载（占用流量和时间），弱网/离线时可能拖慢甚至失败。迁移前会检测并提示，建议先在云盘客户端选择"始终保留在此设备"下载完成后再迁移。</p>
 <p><b>Q：迁移记录在哪？</b><br>A：保存在 state.json 的 migrated 字段，可在"已迁移"标签页查看全部记录。</p>
 <p><b>Q：开发环境迁移和普通迁移有什么区别？</b><br>A：普通迁移只搬数据 + 创建符号链接；开发环境迁移除了搬数据，还会自动配置环境变量（如 npm prefix、cargo home）和修改配置文件（如 Maven settings.xml、Bazel .bazelrc），让工具完整迁移到目标盘。</p>
 <p><b>Q：开发环境迁移后环境变量没生效？</b><br>A：环境变量写入注册表后会广播 WM_SETTINGCHANGE 消息，但<b>已打开的终端/编辑器不会自动刷新</b>。请重新打开终端/编辑器，或重启资源管理器（任务管理器→ explorer.exe→重启）。</p>
@@ -1445,7 +1471,8 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         self.table_dev_env.horizontalHeaderItem(0).setText("")
         self.table_dev_env.horizontalHeaderItem(0).setToolTip("点击此列标题：全选/全不选")
         header_d.sectionClicked.connect(self._on_dev_env_header_clicked)
-        self.table_dev_env.setTextElideMode(Qt.ElideRight)
+        self.table_dev_env.setTextElideMode(Qt.ElideNone)
+        self.table_dev_env.setItemDelegate(NoElideDelegate(self.table_dev_env))
         self.table_dev_env.setWordWrap(False)
         self.table_dev_env.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_dev_env.setSelectionMode(QTableWidget.ExtendedSelection)
@@ -1542,6 +1569,7 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         self.chk_auto.toggled.connect(self.toggle_auto)
         self.chk_clean_vss.toggled.connect(self.toggle_clean_vss)
         self.chk_autostart.toggled.connect(self.toggle_autostart)
+        self.chk_user_dir_notify.toggled.connect(self.toggle_user_dir_notify)
         # 双击表格行打开目录（table_migrated 的双击连接已在表格初始化时完成，此处不重复连接）
         def _scan_double_click(row, col):
             # 说明列(第4列)双击进入编辑，不打开目录
@@ -1684,8 +1712,8 @@ def main():
         import faulthandler
         # 把崩溃 traceback 写入日志文件，同时输出到 stderr（打包时 stderr 被丢弃也无妨）
         faulthandler.enable()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     def _excepthook(exc_type, exc_value, exc_tb):
         """全局未捕获异常钩子：写日志 + 弹窗提示，避免静默死亡"""
@@ -1698,8 +1726,8 @@ def main():
                 0, f"程序遇到未预期的错误：\n{exc_type.__name__}: {exc_value}\n\n"
                    f"详细信息已记录到日志文件，请反馈给开发者。\n日志: {LOG_FILE}",
                 f"{APP_NAME} 错误", 0x10)  # MB_ICONERROR
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
     sys.excepthook = _excepthook
 
     # 单实例检测：防止用户重复启动导致多个监控线程同时跑
@@ -1747,8 +1775,8 @@ def main():
         try:
             if APP_ICON_FILE.exists():
                 app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         app.setQuitOnLastWindowClosed(False)
         log.info("步骤2: 加载配置...")
         # 合并配置（config.json）和状态（state.json）为统一字典
@@ -1768,8 +1796,8 @@ def main():
                 0, f"程序启动失败：\n{type(e).__name__}: {e}\n\n"
                    f"详细信息已记录到日志文件。\n日志: {LOG_FILE}",
                 f"{APP_NAME} 启动错误", 0x10)  # MB_ICONERROR
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         raise
 
 if __name__ == "__main__":

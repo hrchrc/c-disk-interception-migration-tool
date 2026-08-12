@@ -1,6 +1,6 @@
 //! 回归:非扇区对齐尾部的无缓冲复制(sync + IOCP 两条路径)。
 //!
-//! 背景(2026-08-09 glm-pc-updater 事故):installer.exe 160622764 字节
+//! 背景(2026-08-09 updater 事故):installer.exe 160622764 字节
 //! (mod 4096 = 2220),C:→E: 跨盘走 copy_unbuffered_iocp。最后一块写入
 //! 按扇区对齐 pad 后,收尾 `SetEndOfFile(非对齐大小)` 在无缓冲句柄上
 //! 返回 ERROR_INVALID_PARAMETER(87) → 复制失败(实测 sync 路径同样复现)。

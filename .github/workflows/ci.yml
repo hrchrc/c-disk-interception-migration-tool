@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust-engine:
+    name: Rust 引擎测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo test
+        working-directory: rust-engine
+        run: cargo test
+
+  python-tests:
+    name: Python 安全回归测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 运行安全回归测试（纯核心逻辑，不依赖 PySide6）
+        working-directory: src/tests
+        run: python -m unittest test_safety_regressions -v

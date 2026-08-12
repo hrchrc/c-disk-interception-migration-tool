@@ -19,7 +19,7 @@ msg = (
     "迁移失败（返回码 8）。\n"
     "原因：源文件在复制期间被截断或发生变化（ERROR 0xE0000001）\n"
     "建议：文件可能正被其他程序写入（如安装器/更新器正在运行），请关闭相关软件后重新迁移该目录\n"
-    "失败文件：C:\\Users\\aaa\\AppData\\Local\\glm-pc-updater\\installer.exe\n"
+    "失败文件：C:\\Users\\aaa\\AppData\\Local\\updater\\installer.exe\n"
     "已记录未完成事务，目标盘已保留已复制的数据。\n"
     "下次启动程序会自动续传（引擎幂等重跑）。"
 )

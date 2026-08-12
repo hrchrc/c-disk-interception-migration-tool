@@ -60,8 +60,8 @@ def available_languages():
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             label = data.get("_label", code)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         result.append((code, label))
     return result
 

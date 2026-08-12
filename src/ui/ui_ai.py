@@ -108,8 +108,8 @@ class AIHandler:
                 finally:
                     try:
                         pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
         def on_progress(cur, total, desc, name):
             # 进度条+状态栏双重友好提示（非弹窗）
             self.progress.setValue(cur)
@@ -307,8 +307,8 @@ class AIHandler:
                                             files.append(fe.name)
                                             if len(files) >= 15:
                                                 break
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                             items.append((dir_name, path, files))
                     self.items = items
 
@@ -609,8 +609,7 @@ class AIHandler:
         # 说明
         tip = QLabel(
             "说明：AI 识别会批量调用大模型 API，每次扫描后点击 \"AI智能识别\" 按钮补全空说明。\n"
-            "API Key 只保存在本地 config.json，不会上传到任何服务器。\n"
-            "智谱 GLM-4.7-Flash 永久免费，推荐优先使用。"
+            "API Key 只保存在本地 config.json，不会上传到任何服务器。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #1565C0; font-size: 11px; padding: 6px;")

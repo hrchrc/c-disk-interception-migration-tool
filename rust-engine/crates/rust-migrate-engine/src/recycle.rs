@@ -18,13 +18,16 @@ use windows::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
 };
 
-/// IFileOperation 的 CLSID:{3AD05575-8857-4850-8278-1054B1BFCD31}
+/// IFileOperation 的 CLSID:{3AD05575-8857-4850-9274-11B85BDB8E09}
 /// windows-rs 0.58 未导出常量,手动构造(来自 MSDN 文档,非代码引用)。
+/// 2026-08-10 修复:原 CLSID 后两段写错(8278-1054B1BFCD31),导致
+/// CoCreateInstance 永远 REGDB_E_CLASSNOTREG,IFileOperation 从未生效,
+/// 每次软删除都走 SHFileOperationW 兜底。
 const CLSID_FILE_OPERATION: GUID = GUID::from_values(
     0x3AD05575,
     0x8857,
     0x4850,
-    [0x82, 0x78, 0x10, 0x54, 0xB1, 0xBF, 0xCD, 0x31],
+    [0x92, 0x74, 0x11, 0xB8, 0x5B, 0xDB, 0x8E, 0x09],
 );
 
 /// 从 windows::core::Error 提取 Win32 错误码(与 win_io::win32_err 同逻辑,避免跨模块依赖)。

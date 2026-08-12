@@ -135,8 +135,8 @@ class DevEnvRefreshWorker(QThread):
                     default_c = default_c.replace("\\\\?\\", "")
                     if os.path.exists(default_c):
                         size_path = default_c
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         # 3. 兜底：用 status 的 original_path / current_path（仅当在 C 盘时）
         #    VS 等工具的 current_path 能反映真实安装位置（32/64 位目录）
         if not size_path:
@@ -163,8 +163,8 @@ class DevEnvRefreshWorker(QThread):
                 if cached is not None:
                     status["size_mb"] = cached
                     return status
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             # 2. 缓存未命中：实际计算大小
             try:
                 from utils import get_dir_size_fast
@@ -174,8 +174,8 @@ class DevEnvRefreshWorker(QThread):
                 try:
                     from dev_env_migrate import set_cached_size as _scs
                     _scs(cur, size)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             except Exception:
                 status["size_mb"] = -3  # 计算失败
         return status
@@ -458,8 +458,8 @@ class DevToolDownloadWorker(QThread):
                             f.close()
                             try:
                                 os.remove(tmp_path)
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             return
                         chunk = resp.read(chunk_size)
                         if not chunk:
@@ -484,8 +484,8 @@ class DevToolDownloadWorker(QThread):
             # 清理临时文件
             try:
                 os.remove(tmp_path)
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
             raise
 
 
@@ -526,8 +526,8 @@ class DevEnvApplyWorker(QThread):
                     try:
                         info = dev_get_tool_data_info(tool)
                         source_path = info.get("source_path", "")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                     # 1. 应用配置（环境变量+配置命令）
                     # 通用：传 target_path_override 让环境变量指向用户指定的路径
                     if self.migrate_data:

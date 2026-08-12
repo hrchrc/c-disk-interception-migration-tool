@@ -16,7 +16,10 @@ from PySide6.QtCore import Signal, QObject
 import logging
 log = logging.getLogger('CDriveRelocator')
 from config import log_link_operation, log_error_with_reason, save_config
-from utils import is_symlink, get_symlink_target, get_dir_size_fast, link_fix_locked
+from utils import is_symlink, is_junction, get_symlink_target, get_dir_size_fast, link_fix_locked
+from scan_dirs import (get_scan_dirs, get_monitored_base_norms, get_known_folder_paths,
+                       is_user_dir_excluded, USER_LABEL)
+from migrator import build_dev_env_paths
 
 # subprocess 隐藏控制台窗口标志（避免弹黑窗）
 _NO_WINDOW_FLAGS = 0x08000000
@@ -89,8 +92,8 @@ class ScanWorker(QObject):
         try:
             import pythoncom
             pythoncom.CoInitialize()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         try:
             import time
             self.scan_start_time = time.time()
@@ -137,8 +140,8 @@ class ScanWorker(QObject):
                     mft_mode = " [MFT 模式]"
                 elif _s is not None:
                     mft_mode = " [os.walk 模式]"
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             log.info(f"扫描完成{mft_mode}: 待迁移 {len(scanned)} 个 ({total_mb:.0f} MB), "
                      f"已迁移 {len(migrated)} 个, 耗时 {self.scan_elapsed:.2f} 秒")
             self.progress_signal.emit(
@@ -151,8 +154,8 @@ class ScanWorker(QObject):
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
 
 class SmartScanWorker(QObject):
@@ -198,8 +201,8 @@ class SmartScanWorker(QObject):
         try:
             import pythoncom
             pythoncom.CoInitialize()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         try:
             import time
             t_start = time.time()
@@ -213,14 +216,11 @@ class SmartScanWorker(QObject):
             for m in self.migrator.cfg.get("migrated", []):
                 migrated_srcs.add(self._norm_path(m.get("src", "")))
 
-            scan_dirs = [
-                (os.environ.get("LOCALAPPDATA", ""), "Local"),
-                (os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"), "Programs"),
-                (os.environ.get("APPDATA", ""), "Roaming"),
-                (r"C:\Program Files", "Program Files"),
-                (r"C:\Program Files (x86)", "Program Files (x86)"),
-                (r"C:\ProgramData", "ProgramData"),
-            ]
+            scan_dirs = get_scan_dirs()
+            # 用户目录一级子目录的动态排除集合：已监控 base（AppData\Local/Roaming 等）
+            # + 系统特殊文件夹（Known Folder API 解析，不硬编码目录名）
+            _user_dir_monitored = get_monitored_base_norms(scan_dirs)
+            _user_dir_known = get_known_folder_paths()
 
             # 第一阶段：listdir收集所有一级子目录（不计算大小，极快）
             candidates = []
@@ -231,6 +231,11 @@ class SmartScanWorker(QObject):
                     for entry in os.listdir(base_path):
                         full_path = os.path.join(base_path, entry)
                         if not os.path.isdir(full_path):
+                            continue
+                        # 用户目录下：动态排除已在监控列表的子目录（如 AppData\Local）
+                        # 与系统特殊文件夹（桌面/文档/下载等），避免重复与误迁移
+                        if label == USER_LABEL and is_user_dir_excluded(
+                                self._norm_path(full_path), _user_dir_monitored, _user_dir_known):
                             continue
                         if is_symlink(full_path):
                             continue
@@ -255,8 +260,8 @@ class SmartScanWorker(QObject):
                             if all_symlink:
                                 continue
                         candidates.append((full_path, entry, label))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             total = len(candidates)
             new_count = 0
@@ -267,6 +272,8 @@ class SmartScanWorker(QObject):
             # desc 缓存（从 config.json 读取，避免每次扫描都重新识别软件描述）
             desc_cache = self.migrator.cfg.get("desc_cache", {}) if hasattr(self.migrator, 'cfg') else {}
             desc_hit_count = 0
+            # 开发环境已配置的 C 盘源路径索引（与 scan_appdata 一致，[已配置] 橙色标记）
+            dev_env_paths = build_dev_env_paths(getattr(self.migrator, 'cfg', None))
 
             # 第二阶段：对每个目录判断是否需要重新计算大小
             # 增量策略：对比目录 mtime，未变化直接复用旧 size_mb，不调 get_dir_size_fast
@@ -318,6 +325,9 @@ class SmartScanWorker(QObject):
                         t_desc_total += time.time() - _t0
                         new_count += 1
                         recalced_count += 1
+                    # 匹配开发环境已配置（规范化与 scan_appdata 一致：去 \\?\、小写、去尾 \）
+                    fp_norm = full_path.replace("\\\\?\\", "").lower().rstrip("\\")
+                    dev_cfg = dev_env_paths.get(fp_norm)
                     results.append({
                         "path": full_path,
                         "name": entry,
@@ -325,9 +335,14 @@ class SmartScanWorker(QObject):
                         "size_mb": size_mb,
                         "desc": desc,
                         "mtime": cur_mtime,  # 记录 mtime 供下次增量对比
+                        # 开发环境已配置标记（与 scan_appdata 字段一致，智能刷新时橙色标记也能亮）
+                        "dev_env_configured": dev_cfg is not None,
+                        "dev_env_target": dev_cfg.get("target_path", "") if dev_cfg else "",
+                        "dev_env_name": dev_cfg.get("name", "") if dev_cfg else "",
+                        "dev_env_drive": dev_cfg.get("target_drive", "") if dev_cfg else "",
                     })
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             elapsed = time.time() - t_start
             # 检测 MFT 模式
@@ -337,8 +352,8 @@ class SmartScanWorker(QObject):
                 _s = get_mft_scanner()
                 if _s is not None and _s.is_mft_mode:
                     mft_mode = " [MFT 模式]"
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             log.info(f"智能扫描完成{mft_mode}: 共{total}项 (复用{reused_count} 新增{new_count}), "
                      f"大小计算 {t_size_total:.2f} 秒 (mtime复用{reused_size_count} 重算{recalced_count}), "
                      f"描述查缓存 {t_desc_total:.2f} 秒 "
@@ -355,8 +370,8 @@ class SmartScanWorker(QObject):
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
 # ========== 后台监控线程 ==========
 
@@ -366,6 +381,8 @@ class MonitorWorker(QObject):
     finished_signal = Signal()
     new_dir_signal = Signal(str, float)
     alert_signal = Signal(str, str)      # (title, message)
+    # 用户目录写入提醒（右下角自定义气泡，不参与安装拦截）
+    user_dir_alert_signal = Signal(str, str)  # (title, message)
     installer_signal = Signal(str)       # 安装器进程名
     # 系统级安装器拦截信号：(name, pid, exe, cmdline_str)
     # 主线程收到后弹窗询问用户：放行+信任 / 拒绝终止 / 稍后迁移
@@ -506,6 +523,10 @@ class MonitorWorker(QObject):
         self.auto_migrate = auto_migrate
         self.running = True
         self.known_dirs = set()
+        # 用户目录写入提醒开关（右下角气泡；气泡点"不再提醒"或界面开关可热更新）
+        self.user_dir_notify_enabled = migrator.cfg.get("user_dir_notify_enabled", True)
+        # 已提醒过新建的用户目录一级子目录（规范化路径集合，每个目录只提醒一次）
+        self._user_dir_seen = set()
         self._last_periodic = 0
         self._observer = None
         # 从config加载白名单（支持用户自定义）
@@ -577,8 +598,8 @@ class MonitorWorker(QObject):
         except Exception as e:
             try:
                 self.log_signal.emit("error", f"save_state 失败: {e}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             return False
 
     def _start_dir_watchers(self):
@@ -595,14 +616,9 @@ class MonitorWorker(QObject):
         import ctypes
         from ctypes import wintypes
 
-        watch_dirs = [
-            os.environ.get("LOCALAPPDATA", ""),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-            os.environ.get("APPDATA", ""),
-            r"C:\Program Files",
-            r"C:\Program Files (x86)",
-            r"C:\ProgramData",
-        ]
+        # 实时拦截监控目录：6 个关键目录（不含用户目录——用户目录新建不是安装行为，
+        # 由独立 watcher 只做提醒，见下方"用户目录监控"）
+        watch_dirs = [p for p, _ in get_scan_dirs(include_user=False)]
 
         # FILE_NOTIFY_INFORMATION 结构
         class FILE_NOTIFY_INFORMATION(ctypes.Structure):
@@ -629,12 +645,14 @@ class MonitorWorker(QObject):
 
         kernel32 = ctypes.windll.kernel32
 
-        def watch_one_dir(directory, recursive=False):
+        def watch_one_dir(directory, recursive=False, user_mode=False):
             """监控单个目录（守护线程函数）
 
             :param directory: 监控目录
             :param recursive: False=只监控一级子目录（性能优，主目录用），
                               True=递归监控所有子目录（关键安全目录用，如 Startup）
+            :param user_mode: True=用户目录模式：新建目录只弹右下角提醒，
+                              不参与安装拦截（不 kill、不写拦截记录、不弹安装警告）
             """
             if not directory or not os.path.exists(directory):
                 return
@@ -697,8 +715,15 @@ class MonitorWorker(QObject):
                                     full_path = os.path.join(directory, name)
                                     # 事件分类处理
                                     if entry.Action in (FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME):
+                                        if user_mode:
+                                            # 用户目录模式：只做右下角提醒，不参与安装拦截
+                                            try:
+                                                self._on_user_dir_event(full_path, os.path.isdir(full_path))
+                                            except Exception as e:
+                                                self.log_signal.emit("error",
+                                                    f"用户目录 watcher 处理 {full_path} 失败: {e}")
                                         # 目录创建或重命名 → 主力触发
-                                        if os.path.isdir(full_path):
+                                        elif os.path.isdir(full_path):
                                             try:
                                                 self._on_dir_created(full_path)
                                             except Exception as e:
@@ -709,16 +734,20 @@ class MonitorWorker(QObject):
                                             self._on_file_in_new_dir(full_path)
                                     elif entry.Action == FILE_ACTION_MODIFIED:
                                         # 文件修改（写入）→ 检查是否在"最近5秒新建的目录"下
-                                        if os.path.isfile(full_path):
+                                        if user_mode:
+                                            # 用户目录直接文件写入：仅日志，不打扰（高频）
+                                            self._on_user_dir_event(full_path, False)
+                                        elif os.path.isfile(full_path):
                                             self._on_file_in_new_dir(full_path)
                                     elif entry.Action in (FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_OLD_NAME):
                                         # 文件/目录删除或重命名 → 触发删除拦截
                                         # 修复漏洞：原代码完全不处理删除事件，导致病毒可随意删除文件
-                                        try:
-                                            self._on_file_removed(full_path)
-                                        except Exception as e:
-                                            self.log_signal.emit("error",
-                                                f"watcher 处理删除 {full_path} 失败: {e}")
+                                        if not user_mode:
+                                            try:
+                                                self._on_file_removed(full_path)
+                                            except Exception as e:
+                                                self.log_signal.emit("error",
+                                                    f"watcher 处理删除 {full_path} 失败: {e}")
                                 # 下一个事件
                                 if entry.NextEntryOffset == 0:
                                     break
@@ -729,14 +758,14 @@ class MonitorWorker(QObject):
                         if self.running:
                             try:
                                 self.log_signal.emit("error", f"watcher {directory} 异常: {e}")
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                         break
 
                 try:
                     kernel32.CloseHandle(handle)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             except Exception as e:
                 self.log_signal.emit("error", f"watcher 启动失败 {directory}: {e}")
 
@@ -747,6 +776,13 @@ class MonitorWorker(QObject):
                 t = threading.Thread(target=watch_one_dir, args=(d, False), daemon=True)
                 t.start()
                 main_count += 1
+
+        # 用户目录监控（不参与安装拦截）：一级子目录新建 → 右下角气泡提醒
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile and os.path.exists(user_profile):
+            t = threading.Thread(target=watch_one_dir, args=(user_profile, False, True), daemon=True)
+            t.start()
+            main_count += 1
 
         # 关键安全目录：递归监控（recursive=True），捕获深层子目录的删除/篡改行为
         # 这些目录文件少、层级深，recursive=True 不会导致 CPU 爆炸
@@ -777,14 +813,7 @@ class MonitorWorker(QObject):
 
         # 2. 轻量初始化已知目录（只listdir收集目录名，不获取大小/说明，避免遍历大目录卡死）
         self.log_signal.emit("init", "初始化已知目录...")
-        init_scan_dirs = [
-            os.environ.get("LOCALAPPDATA", ""),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-            os.environ.get("APPDATA", ""),
-            r"C:\Program Files",
-            r"C:\Program Files (x86)",
-            r"C:\ProgramData",
-        ]
+        init_scan_dirs = [p for p, _ in get_scan_dirs(include_user=False)]
         for base_path in init_scan_dirs:
             if not base_path or not os.path.exists(base_path):
                 continue
@@ -793,8 +822,8 @@ class MonitorWorker(QObject):
                     full_path = os.path.join(base_path, entry)
                     if os.path.isdir(full_path):
                         self.known_dirs.add(full_path)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         for m in self.migrator.scan_migrated():
             self.known_dirs.add(m["src"])
         self.log_signal.emit("init", f"已知 {len(self.known_dirs)} 个目录，初始化完成")
@@ -836,14 +865,14 @@ class MonitorWorker(QObject):
                                       if now - v[0] > 5]
                             for k in expired:
                                 self._recent_new_dirs.pop(k, None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
             except Exception as e:
                 # 防止异常导致监控线程崩溃
                 try:
                     self.log_signal.emit("error", f"监控循环异常: {type(e).__name__}: {e}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             time.sleep(0.1)
 
         # 清理
@@ -851,8 +880,8 @@ class MonitorWorker(QObject):
             try:
                 self._observer.stop()
                 self._observer.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self.finished_signal.emit()
 
     def _on_file_in_new_dir(self, file_path):
@@ -898,8 +927,8 @@ class MonitorWorker(QObject):
         except Exception as e:
             try:
                 self.log_signal.emit("error", f"_on_file_in_new_dir 异常: {e} path={file_path}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _on_file_removed(self, path):
         """文件/目录删除或重命名触发 - 审计记录 + 告警（不 kill）
@@ -946,8 +975,8 @@ class MonitorWorker(QObject):
         except Exception as e:
             try:
                 self.log_signal.emit("error", f"_on_file_removed 步骤1(基础检查)异常: {e}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             return
 
         # 步骤2：记录删除行为到监控日志（审计用途）
@@ -957,8 +986,8 @@ class MonitorWorker(QObject):
         except Exception as e:
             try:
                 self.log_signal.emit("error", f"_on_file_removed 步骤2(日志emit)异常: {e}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         # 步骤3：记录到 blocked_processes（审计日志）
         # 不 kill、不弹 alert —— 避免误杀系统进程 + 避免正常删除时骚扰用户
@@ -981,8 +1010,48 @@ class MonitorWorker(QObject):
         except Exception as e:
             try:
                 self.log_signal.emit("error", f"写入blocked_processes失败(删除): {e}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
+
+    def _on_user_dir_event(self, path, is_dir=False):
+        """用户目录一级子目录事件 → 右下角气泡提醒（不参与安装拦截）
+
+        只提醒"一级子目录新建"（AI 工具等新目录吃 C 盘的典型信号），
+        每个目录只提醒一次（_user_dir_seen 去重，防重复弹窗）；
+        用户目录下的直接文件写入/删除事件不打扰用户（高频），仅由日志记录。
+
+        限制（ReadDirectoryChangesW recursive=False）：
+        深层孙目录写入（如 .ollama\\models\\xxx）不产生事件，
+        膨胀可见性由待迁移区扫描兜底。
+        """
+        try:
+            # 文件写入/删除事件（高频，且 recursive=False 下只涉及用户目录直接文件）
+            # 直接忽略，只关心一级子目录新建
+            if not is_dir:
+                return
+            # 新建 junction 不算数据膨胀（链接实体 0 字节，数据在目标盘），不提醒
+            if is_junction(path):
+                return
+            if not self.user_dir_notify_enabled:
+                return
+            user_profile = os.environ.get("USERPROFILE", "")
+            if not user_profile or not path:
+                return
+            # 只看用户目录一级子目录的新建（parent 恰好等于用户目录）
+            norm = path.replace("\\", "/").lower().rstrip("/")
+            up_norm = user_profile.replace("\\", "/").lower().rstrip("/")
+            if os.path.dirname(path).replace("\\", "/").lower().rstrip("/") != up_norm:
+                return
+            if norm in self._user_dir_seen:
+                return
+            self._user_dir_seen.add(norm)
+            self.log_signal.emit("new", f"用户目录新建目录: {path}")
+            self.user_dir_alert_signal.emit(
+                "用户目录写入提醒",
+                f"检测到用户目录 {user_profile} 下新建目录：\n{path}\n\n"
+                f"可在待迁移区查看并迁移，或点击气泡\"不再提醒\"关闭")
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _on_dir_created(self, path):
         """目录创建瞬间触发 - 立即弹窗
@@ -1192,10 +1261,10 @@ class MonitorWorker(QObject):
                 if has_write:
                     self._do_kill_installer(proc, name, pid, exe,
                         f"可疑进程有写入行为({write_reason})", killed)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            except Exception:
-                pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                log.debug("忽略异常: %s", e)
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         # ===== 第二优先级：查 _recent_procs 缓存中的强关键词进程 =====
         # _recent_procs 由主循环每0.3秒更新，包含所有进程的 pid+name
@@ -1241,10 +1310,10 @@ class MonitorWorker(QObject):
                 # kill 强关键词进程
                 self._do_kill_installer(proc, name, pid, exe,
                     f"强关键词+最近30秒启动", killed)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            except Exception:
-                pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                log.debug("忽略异常: %s", e)
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         # ===== 第三优先级：兜底枚举（总是执行）=====
         # 处理既不在可疑进程池、也不是强关键词的写入者（如 exe 在 %TEMP% 下的自解压安装器）
@@ -1308,8 +1377,8 @@ class MonitorWorker(QObject):
                     f"触发目录: {trigger_path}\n已 kill {len(killed)} 个安装器进程:\n{names}\n\n"
                     f"进程已被强制终止，防止继续向 C 盘安装。"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         else:
             self.log_signal.emit("warn",
                 f"安装行为触发但未找到可疑进程(可能已退出): {trigger_path}")
@@ -1362,8 +1431,8 @@ class MonitorWorker(QObject):
         # 从可疑进程池中移除已处理的 PID
         try:
             self._suspicious_procs.pop(pid, None)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _cleanup_residue(self, path):
         """kill 后清理安装器残留目录（三级删除策略，参考 migrator.py）
@@ -1415,8 +1484,8 @@ class MonitorWorker(QObject):
             if os.path.exists(bak_path):
                 try:
                     shutil.rmtree(bak_path, ignore_errors=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             os.rename(path, bak_path)
             self.log_signal.emit("warn",
                 f"残留目录被占用，已重命名为 {os.path.basename(bak_path)}，将由后台清理")
@@ -1531,8 +1600,8 @@ class MonitorWorker(QObject):
                                 # 3) 系统级安装器进程名（误杀风险低，直接走暂停询问）
                                 if name_lower in self.PACKAGE_MANAGER_PROCS:
                                     pkg_matches.append((name, pid))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                     if not kernel32.Process32Next(snapshot, ctypes.byref(pe)):
                         break
             kernel32.CloseHandle(snapshot)
@@ -1587,8 +1656,8 @@ class MonitorWorker(QObject):
                         args=(name, pid, exe, cmdline_str, f"强关键词匹配: {name}"),
                         daemon=True
                     ).start()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log.debug("忽略异常: %s", e)
 
             # 处理 weak_matches（弱关键词，只记录到可疑进程池，不主动杀）
             # 这些进程不杀，但记录 pid + create_time + exe，供 watchdog 写入行为触发时反查
@@ -1629,10 +1698,10 @@ class MonitorWorker(QObject):
                             "record_time": now,
                             "init_write_bytes": init_write,
                         }
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-                except Exception:
-                    pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log.debug("忽略异常: %s", e)
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             # 清理过期的可疑进程记录（超过 120 秒的），避免字典无限增长
             with self._suspicious_lock:
                 expired_pids = [p for p, info in list(self._suspicious_procs.items())
@@ -1640,8 +1709,8 @@ class MonitorWorker(QObject):
                 for p in expired_pids:
                     try:
                         del self._suspicious_procs[p]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
 
             # 处理 pkg_matches（系统级安装器，暂停询问流程）
             for name, pid in pkg_matches:
@@ -1687,10 +1756,10 @@ class MonitorWorker(QObject):
                         args=(name, pid, exe, cmdline_str, f"包管理器进程名匹配: {name}"),
                         daemon=True
                     ).start()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except ImportError:
-            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log.debug("忽略异常: %s", e)
+        except ImportError as e:
+            log.debug("忽略异常: %s", e)
 
     def _is_user_triggered_msiexec(self, proc):
         """判断 msiexec 是否用户触发（非系统服务）
@@ -1820,8 +1889,8 @@ class MonitorWorker(QObject):
                     self.migrator.cfg["blocked_processes"] = blocked[-200:]
                 # 修复：blocked_processes 是 STATE_FIELDS，用 _save_blocked_processes 持久化
                 self._save_blocked_processes()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             return
 
         try:
@@ -1867,8 +1936,8 @@ class MonitorWorker(QObject):
                 if suspend_ok:
                     try:
                         proc.resume()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.log_signal.emit("init", f"用户放行: {name} (PID:{pid})")
             elif decision == "kill":
                 try:
@@ -1882,15 +1951,15 @@ class MonitorWorker(QObject):
                     if suspend_ok:
                         try:
                             proc.resume()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     self.log_signal.emit("error", f"终止失败已放行: {name}: {e}")
             elif decision == "migrate_later":
                 if suspend_ok:
                     try:
                         proc.resume()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.log_signal.emit("warn",
                     f"用户选择稍后迁移: {name} (PID:{pid})，请在「待迁移」表右键迁移")
                 self.alert_signal.emit(
@@ -1903,8 +1972,8 @@ class MonitorWorker(QObject):
                 if suspend_ok:
                     try:
                         proc.resume()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.log_signal.emit("warn",
                     f"60秒未决策，自动放行: {name} (PID:{pid})")
                 self.alert_signal.emit(
@@ -1913,8 +1982,8 @@ class MonitorWorker(QObject):
                     f"60 秒内未做出决策，已自动放行。\n"
                     f"请稍后在「待迁移」表手动迁移该目录。"
                 )
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            log.debug("忽略异常: %s", e)
         # 同时记录到 blocked_processes（供白名单"从拦截日志添加"使用）
         try:
             blocked = self.migrator.cfg.setdefault("blocked_processes", [])
@@ -1929,8 +1998,8 @@ class MonitorWorker(QObject):
                 self.migrator.cfg["blocked_processes"] = blocked[-200:]
             # 修复：blocked_processes 是 STATE_FIELDS，用 _save_blocked_processes 持久化
             self._save_blocked_processes()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _is_installer_process(self, name, exe, cmdline):
         """判断是否是安装器进程（通用）"""
@@ -1941,7 +2010,7 @@ class MonitorWorker(QObject):
             "pythonw.exe",      # 本工具运行进程
             "python.exe",       # 本工具开发模式
             "rust-migrate-engine.exe",  # P6:本工具的 Rust 复制引擎子进程(会写 C 盘数据,不能误杀)
-            "c盘拦迁器",         # 本工具打包后名称（v0.02+）
+            "c盘拦迁器",         # 本工具打包后名称（v0.03+）
             "c盘拦迁器",       # 本工具旧名称（兼容）
             "c-drive-guard",   # 本工具英文名（旧）
             "cdriverelocator",
@@ -2045,14 +2114,7 @@ class MonitorWorker(QObject):
         """
         try:
             # 轻量扫描：只listdir收集目录列表，不获取大小
-            scan_bases = [
-                os.environ.get("LOCALAPPDATA", ""),
-                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-                os.environ.get("APPDATA", ""),
-                r"C:\Program Files",
-                r"C:\Program Files (x86)",
-                r"C:\ProgramData",
-            ]
+            scan_bases = [p for p, _ in get_scan_dirs(include_user=False)]
             current_set = set()
             for base_path in scan_bases:
                 if not base_path or not os.path.exists(base_path):
@@ -2062,8 +2124,8 @@ class MonitorWorker(QObject):
                         full_path = os.path.join(base_path, entry)
                         if os.path.isdir(full_path):
                             current_set.add(full_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             # 发现新目录
             new_dirs = current_set - self.known_dirs
@@ -2087,16 +2149,16 @@ class MonitorWorker(QObject):
                         size = 0.0
                     try:
                         self.log_signal.emit("new", f"发现新目录(兜底): {new_dir} ({size} MB)")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                     try:
                         self.new_dir_signal.emit(new_dir, size)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                     try:
                         self.log_signal.emit("error", f"_on_dir_created 处理 {new_dir} 失败: {type(e).__name__}: {e}")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
             self.known_dirs = current_set
             for m in self.migrator.cfg.get("migrated", []):
                 self.known_dirs.add(m.get("src", ""))
@@ -2123,20 +2185,13 @@ class MonitorWorker(QObject):
                                 log.info(f"清理备份目录: {bak_path}")
                             except Exception:
                                 pass  # 文件仍被占用，等下次再试
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             # 清理安装拦截时重命名的残留目录（._install_residue_bak 后缀）
             # 这些目录是 kill 安装器后部分文件被占用无法删除而重命名的，软件关闭后可删除
             # 扫描所有监控目录下的 ._install_residue_bak 残留
-            cleanup_scan_dirs = [
-                os.environ.get("LOCALAPPDATA", ""),
-                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-                os.environ.get("APPDATA", ""),
-                r"C:\Program Files",
-                r"C:\Program Files (x86)",
-                r"C:\ProgramData",
-            ]
+            cleanup_scan_dirs = [p for p, _ in get_scan_dirs(include_user=False)]
             for base_path in cleanup_scan_dirs:
                 if not base_path or not os.path.isdir(base_path):
                     continue
@@ -2152,8 +2207,8 @@ class MonitorWorker(QObject):
                                     log.info(f"清理拦截残留: {bak_path}")
                             except Exception:
                                 pass  # 仍被占用，等下次再试
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             # 检查符号链接是否被破坏 - 自动修复（对付无视符号链接在C盘真实目录安装的软件）
             # 跳过正在还原中的 src（避免与 _RestoreDataWorker 抢资源，防止"自动修复"
             # 把正在复制回 C 盘的数据再次迁回 D 盘）
@@ -2243,8 +2298,8 @@ class MonitorWorker(QObject):
             try:
                 shutil.rmtree(src_path)
                 delete_ok = True
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
             # 2b. 如果rmtree失败（文件被占用），尝试重命名后创建链接
             if not delete_ok:
@@ -2254,8 +2309,8 @@ class MonitorWorker(QObject):
                     if os.path.exists(bak_path):
                         try:
                             shutil.rmtree(bak_path)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     os.rename(src_path, bak_path)
                     delete_ok = True
                     # 标记需要后台清理（下次检查时会尝试删除）

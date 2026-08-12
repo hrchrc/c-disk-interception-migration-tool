@@ -3,7 +3,7 @@
 
 背景(2026-08-09)：RecycleBin(IFileOperation CLSID 未注册)、无缓冲 I/O
 非对齐 truncate、符号链接权限等环境问题，此前只能等用户实际迁移时踩坑
-(glm-pc-updater 事故:测试全在同盘/热缓存/对齐文件的"理想组合"上跑，
+(updater 事故:测试全在同盘/热缓存/对齐文件的"理想组合"上跑，
 跨盘 IOCP + 非对齐尾部 + 冷启动的环境组合从未覆盖)。
 
 本模块提供探测函数：
@@ -20,6 +20,7 @@ import os
 import shutil
 import tempfile
 import winreg
+from pathlib import Path
 
 # IFileOperation 的 CLSID（purge 软删除首选路径；未注册则降级 SHFileOperationW/硬删）
 CLSID_FILE_OPERATION = "{3AD05575-8857-4850-8278-1054B1BFCD31}"
@@ -172,6 +173,30 @@ def check_target_drive(g_root):
         detail = f"{drive} 可写"
         if sector:
             detail += f"，逻辑扇区 {sector}B"
+        # 文件系统类型：非 NTFS 目标盘有静默风险
+        # - FAT32：单文件最大 4GB，大文件迁移中途失败
+        # - exFAT：无 ACL / 硬链接 / 稀疏文件支持，引擎保留的属性会丢失
+        fs_name = ""
+        try:
+            GetVolumeInformationW = ctypes.windll.kernel32.GetVolumeInformationW
+            _vol = ctypes.create_unicode_buffer(64)
+            _fs = ctypes.create_unicode_buffer(32)
+            # pathlib 取盘符根（含尾反斜杠，Windows API 要求）
+            _root = str(Path(drive).anchor)
+            _ok = GetVolumeInformationW(_root, _vol, 64, None, None, None, _fs, 32)
+            if _ok:
+                fs_name = _fs.value
+        except Exception:
+            pass
+        if fs_name and fs_name.upper() != "NTFS":
+            _fs_upper = fs_name.upper()
+            if _fs_upper == "FAT32":
+                _fs_warn = "FAT32 单文件最大 4GB，大文件迁移会失败"
+            else:
+                _fs_warn = "无 NTFS 的 ACL/硬链接/稀疏文件支持，部分属性会丢失"
+            return ("目标盘", "warn",
+                    f"{drive} 是 {fs_name} 文件系统（{_fs_warn}），"
+                    f"建议使用 NTFS 格式的磁盘")
         return ("目标盘", "ok", detail)
     except Exception as e:
         return ("目标盘", "fail", f"检测异常: {e}")

@@ -596,8 +596,8 @@ class DevEnvHandler:
                     if _w in self._old_dev_env_workers:
                         self._old_dev_env_workers.remove(_w)
                     _w.deleteLater()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             worker.finished.connect(_cleanup_old_worker)
             self._old_dev_env_workers.append(worker)
             setattr(self, attr_name, None)
@@ -696,6 +696,7 @@ class DevEnvHandler:
 
             def _on_done(rows_data, drive):
                 """主线程：全部完成，最终统计 + 保存缓存"""
+                from utils import is_symlink  # 本闭包内使用（721 行）
                 try:
                     # 流式刷新已经把每行更新好了，这里只做最终统计 + 缓存
                     # 不再调 _populate_dev_env_table（避免清表重建造成视觉闪烁）
@@ -720,8 +721,8 @@ class DevEnvHandler:
                         sp = (cfg_info.get("source_path") or "").replace("\\\\?\\", "")
                         if sp and is_symlink(sp):
                             migrated += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 self.stat_dev_env.setText(
                     f"共{len(rows_data)}项 | 已装{installed}项 | "
                     f"在C盘待配置{on_c}项 | 已配置到目标盘{configured}项"
@@ -804,8 +805,8 @@ class DevEnvHandler:
                     self.on_monitor_log("dev_env",
                         f"局部刷新完成（{len(rows_data)} 项：已装{installed}，"
                         f"在C盘{on_c}，已配置{configured}）")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             worker.finished_signal.connect(_on_partial_done)
             worker.error_signal.connect(
@@ -816,8 +817,8 @@ class DevEnvHandler:
             # 兜底：全表刷新
             try:
                 self._refresh_dev_env_table(silent=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _cleanup_old_worker(self, worker):
         """清理已完成的旧 worker（从 _old_dev_env_workers 列表移除）"""
@@ -825,8 +826,8 @@ class DevEnvHandler:
             if worker in self._old_dev_env_workers:
                 self._old_dev_env_workers.remove(worker)
             worker.deleteLater()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _partial_update_dev_env_rows(self, rows_data, target_drive):
         """局部更新表格行：只更新 rows_data 中的工具，保留其他行
@@ -1049,6 +1050,7 @@ class DevEnvHandler:
         self.table_dev_env.setRowCount(0)
         # 填充时阻塞 itemChanged 信号，避免触发 _on_dev_env_item_changed
         self.table_dev_env.blockSignals(True)
+        from utils import is_symlink  # 本函数内使用（721/1082/1092 行）
         installed_count = 0
         on_c_count = 0
         configured_count = 0
@@ -1470,8 +1472,8 @@ class DevEnvHandler:
                                           migrated_records=self.cfg.get("migrated", []))
                 if status.get("is_symlink") and not status["configured"] and status["installed"]:
                     tools_to_config.append(tool)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         if not tools_to_config:
             QMessageBox.information(self, "无需配置",
@@ -1758,8 +1760,8 @@ class DevEnvHandler:
                 # 确保 worker 线程完全退出，避免模态对话框期间的竞态
                 try:
                     worker.wait(500)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 self.progress.setVisible(False)
                 self.btn_apply_dev.setEnabled(True)
                 # 转成 [(name, ok, msg), ...] 格式（丢弃 source_path，下面单独取）
@@ -1865,8 +1867,8 @@ class DevEnvHandler:
                     self.btn_apply_dev.setEnabled(True)
                     QMessageBox.critical(self, "内部错误",
                         f"批量配置完成但刷新界面时出错：\n{e}\n\n配置已保存，请手动刷新表格。")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         def _on_error(err):
             try:
@@ -2432,8 +2434,8 @@ class DevEnvHandler:
                         # 注意：这里返回祖先路径，还原时会还原整个祖先目录
                         log.info(f"  {tool.get('name','')}: 候选路径 {cand} 的祖先 {parent} 是符号链接")
                         return parent, None
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 cur = parent
 
         # 兜底：在 migrated 中按候选路径的 basename 模糊匹配
@@ -2852,8 +2854,8 @@ class DevEnvHandler:
                 self.progress.setVisible(False)
                 QMessageBox.critical(self, "内部错误",
                     f"启动还原操作时出错：\n{e}\n\n详情已记录到日志，请重试或反馈给开发者。")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _apply_single_dev_tool(self, tool):
         """单独应用一个工具的配置（通用：支持 C→D / D→D / D→E / E→F 等任意盘间迁移）
@@ -2987,8 +2989,8 @@ class DevEnvHandler:
                 # （QMessageBox.information 会启动嵌套事件循环，此时 QThread 可能在清理中）
                 try:
                     worker.wait(500)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 # worker_results 是 [(tool, ok, msg, source_path), ...]，取第一个
                 if not worker_results:
                     return
@@ -3074,8 +3076,8 @@ class DevEnvHandler:
                 try:
                     QMessageBox.critical(self, "内部错误",
                         f"配置完成但刷新界面时出错：\n{e}\n\n配置已保存，请手动刷新表格。")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 # 异常时也刷新表格（避免 on_monitor_log 等非关键异常导致表格不更新）
                 try:
                     self._refresh_dev_env_table()
@@ -3201,8 +3203,8 @@ class DevEnvHandler:
             return
         try:
             os.makedirs(path, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         self._open_path(path)
 
     def _delete_configured_dir(self, tbl, records):
@@ -3229,8 +3231,8 @@ class DevEnvHandler:
                     try:
                         fp = os.path.join(dirpath, f)
                         total_size += os.path.getsize(fp)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
             size_mb = total_size / (1024 * 1024)
             size_str = f"{size_mb:.2f} MB"
         except Exception:

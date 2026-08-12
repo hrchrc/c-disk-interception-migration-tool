@@ -621,7 +621,7 @@ pub fn parse_records_bulk(
                     if attr_len < 0x40 {
                         break;
                     }
-                    data_real_size = rd_u64(rec, pos + 0x30);
+                    data_real_size = rd_u64(rec, pos + 0x28); // 0x28=AllocatedSize(实际占用)：占位符/稀疏文件比 DataLength(0x30) 更真实
                     is_non_resident_data = true;
                 }
                 has_data = true;

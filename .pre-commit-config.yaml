@@ -1,0 +1,16 @@
+# pre-commit hooks（安装：pip install pre-commit && pre-commit install）
+# 只启用安全级检查：语法/逻辑错误 + 空白/文件尾规范，不做风格强制
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        # 仅语法/逻辑错误级（与 pyproject.toml [tool.ruff.lint] 一致）
+        args: [--select, E9,F63,F7,F82]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict

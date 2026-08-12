@@ -68,6 +68,7 @@ class MonitorLogHandler:
         self.monitor_thread.started.connect(self.monitor_worker.run)
         self.monitor_worker.log_signal.connect(self.on_monitor_log, Qt.QueuedConnection)
         self.monitor_worker.alert_signal.connect(self.on_alert, Qt.QueuedConnection)
+        self.monitor_worker.user_dir_alert_signal.connect(self._on_user_dir_alert, Qt.QueuedConnection)
         self.monitor_worker.installer_signal.connect(self.on_installer_detected, Qt.QueuedConnection)
         self.monitor_worker.installer_confirm_signal.connect(self.on_installer_confirm, Qt.QueuedConnection)
         self.monitor_worker.finished_signal.connect(self.monitor_thread.quit, Qt.QueuedConnection)
@@ -130,10 +131,10 @@ class MonitorLogHandler:
             try:
                 from config import rotate_log_if_needed
                 rotate_log_if_needed(MONITOR_LOG_FILE)
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         # UI 渲染限频：距上次渲染 > 500ms 才重绘，否则延迟到下次
         import time as _time
         now = _time.time()
@@ -198,8 +199,8 @@ class MonitorLogHandler:
             # 只有当前在监控日志 Tab 才渲染（避免不必要的 UI 刷新）
             if self.tabs.currentIndex() == 2:
                 self._render_monitor_log()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     # 监控日志事件类型→(中文标签, 颜色) 映射
     _LOG_TYPE_MAP = {
@@ -284,6 +285,46 @@ class MonitorLogHandler:
         self.on_monitor_log("alert", f"{title}: {message}")
         log.warning(f"[alert] {title}: {message}")
 
+    def _on_user_dir_alert(self, title, message):
+        """用户目录写入提醒 → 软件内自定义右下角气泡（不弹系统大对话框）
+
+        消息含动态路径，走 i18n 模板翻译（路径保留原文）；
+        监控日志由 monitor 侧 log_signal 记录，这里不重复写。
+        气泡带"不再提醒"按钮，点击后持久化关闭；界面开关可重新开启。
+        """
+        try:
+            from i18n import tr
+            from ui_widgets import show_notify_bubble
+            show_notify_bubble(tr(title), tr(message),
+                               on_dont_notify=self._disable_user_dir_notify)
+        except Exception as e:
+            log.error(f"显示用户目录提醒气泡失败: {e}")
+            # 兜底：退回托盘气泡 + 监控日志
+            if self.tray_icon:
+                self.tray_icon.showMessage(title, message, QSystemTrayIcon.Warning, 5000)
+            self.on_monitor_log("new", f"{title}: {message}")
+        log.info(f"[user_dir_alert] {title}: {message}")
+
+    def _disable_user_dir_notify(self):
+        """气泡点"不再提醒"：持久化关闭 + 热更新监控线程 + 同步界面开关"""
+        try:
+            self.cfg["user_dir_notify_enabled"] = False
+            save_all(self.cfg)
+            if getattr(self, "monitor_worker", None):
+                self.monitor_worker.user_dir_notify_enabled = False
+            # 界面开关同步（若已构建）
+            chk = getattr(self, "chk_user_dir_notify", None)
+            if chk is not None:
+                try:
+                    chk.blockSignals(True)
+                    chk.setChecked(False)
+                    chk.blockSignals(False)
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
+            log.info("用户目录写入提醒已关闭（气泡'不再提醒'）")
+        except Exception as e:
+            log.error(f"关闭用户目录写入提醒失败: {e}")
+
     def on_installer_detected(self, proc_name):
         """检测到安装器进程 - 日志记录，不弹窗不抢焦点"""
         msg = f"检测到安装器进程: {proc_name}"
@@ -350,8 +391,8 @@ class MonitorLogHandler:
                 timer.stop()
                 try:
                     msg_box.done(QMessageBox.Rejected)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         update_text()  # 初始显示（60 秒）
 
@@ -372,8 +413,8 @@ class MonitorLogHandler:
                         geo.center().x() - msg_box.width() // 2,
                         geo.center().y() - msg_box.height() // 2
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         QTimer.singleShot(0, raise_and_center)
 
@@ -399,8 +440,8 @@ class MonitorLogHandler:
                         # 同步更新 monitor 内存中的 whitelist
                         if hasattr(self, 'monitor_worker') and self.monitor_worker:
                             self.monitor_worker.whitelist = wl
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 self.monitor_worker.set_decision(pid, "allow")
                 # 日志由 monitor.py 后台线程统一打印（避免重复）
             elif clicked == btn_kill:
@@ -418,8 +459,8 @@ class MonitorLogHandler:
             # 决策回传失败，默认放行避免进程卡死
             try:
                 self.monitor_worker.set_decision(pid, "allow")
-            except Exception:
-                pass
+            except Exception as e2:
+                log.debug("忽略异常: %s", e2)
             log_error_with_reason("安装拦截决策回传失败", str(e),
                 f"on_installer_confirm: {name} PID:{pid}")
 
@@ -427,8 +468,8 @@ class MonitorLogHandler:
         """向监控日志发消息（主线程安全）"""
         try:
             self.on_monitor_log(event_type, message)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _refresh_log_only(self):
         """刷新监控日志 - 从 监控日志.log 文件读取最近1000条到cache，再渲染"""

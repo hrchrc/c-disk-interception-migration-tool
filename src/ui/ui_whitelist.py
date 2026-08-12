@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import save_all
-from ui_widgets import WideEditorDelegate
+from ui_widgets import WideEditorDelegate, NoElideDelegate
 
 log = logging.getLogger('CDriveRelocator')
 
@@ -70,7 +70,8 @@ class WhitelistHandler:
         self._wl_default_table.horizontalHeader().setMinimumSectionSize(100)
         self._wl_default_table.horizontalHeader().resizeSection(0, 200)
         self._wl_default_table.horizontalHeader().resizeSection(1, 400)
-        self._wl_default_table.setTextElideMode(Qt.ElideRight)
+        self._wl_default_table.setTextElideMode(Qt.ElideNone)
+        self._wl_default_table.setItemDelegate(NoElideDelegate(self._wl_default_table))
         self._wl_default_table.setWordWrap(False)
         self._wl_default_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._wl_default_table.setSelectionMode(QTableWidget.ExtendedSelection)
@@ -88,7 +89,8 @@ class WhitelistHandler:
         self._wl_table.horizontalHeader().setMinimumSectionSize(100)
         self._wl_table.horizontalHeader().resizeSection(0, 200)
         self._wl_table.horizontalHeader().resizeSection(1, 400)
-        self._wl_table.setTextElideMode(Qt.ElideRight)
+        self._wl_table.setTextElideMode(Qt.ElideNone)
+        self._wl_table.setItemDelegate(NoElideDelegate(self._wl_table))
         self._wl_table.setWordWrap(False)
         self._wl_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._wl_table.setSelectionMode(QTableWidget.ExtendedSelection)

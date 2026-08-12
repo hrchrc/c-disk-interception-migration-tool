@@ -226,8 +226,8 @@ class ScanHandler:
                 finally:
                     try:
                         pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
         def on_filled(path, desc):
             # 更新 scan_cache 和 desc_cache
             try:
@@ -562,8 +562,8 @@ class ScanHandler:
                     dst = m.get("dst", "") or m.get("target", "")
                     if dst and os.path.exists(dst):
                         pending.append((m["src"], dst))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         if not pending:
             return
         log.info(f"开始计算 {len(pending)} 个已迁移目录的大小（目标在其他盘，走 os.walk）")
@@ -592,8 +592,8 @@ class ScanHandler:
                         size = get_dir_size_fast(dst)
                         self.size_signal.emit(src, size)
                         count += 1
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 log.info(f"已迁移目录大小计算完成: {count}/{len(self.items)} 个, 耗时 {time.time()-t0:.2f} 秒")
                 self.finished_signal.emit()
 
@@ -820,8 +820,8 @@ class ScanHandler:
                     "orig_path": orig_path,
                     "mtime": old_mtime,
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         # 禁用扫描按钮（不禁用联网搜索按钮，允许同时进行）
         self.btn_refresh.setEnabled(False)

@@ -6,7 +6,11 @@ import os
 import ctypes
 import threading
 import functools
+import logging
 from pathlib import Path
+
+# 与主项目共用日志通道（main.py 配置的 'CDriveRelocator' handler）
+log = logging.getLogger('CDriveRelocator')
 
 # 全局 MFT 扫描器单例（由 main.py 启动时注入）
 # 未注入时 get_dir_size_fast 自动回退到 os.walk
@@ -46,8 +50,8 @@ def set_mft_scanner(scanner):
     if old is not None and old is not scanner:
         try:
             old.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
     _mft_scanner = scanner
 
 def get_mft_scanner():
@@ -74,17 +78,65 @@ def get_dir_size_fast(path):
             for f in filenames:
                 try:
                     total += os.path.getsize(os.path.join(dirpath, f))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
         # 保留 6 位小数（最小到 1 字节），避免小目录被 round 成 0.0 显示为"0B"
         return round(total / 1024 / 1024, 6)
     except Exception as e:
         try:
             from config import log_error_with_reason
             log_error_with_reason("未知错误", str(e), f"get_dir_size_fast: {path}")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         return 0
+
+# ========== 云同步占位符检测 ==========
+# OneDrive/坚果云等云盘用"占位文件"（RECALL/OFFLINE 属性位）减少本地占用；
+# 复制引擎按普通文件读取时会触发强制下载（hydration），弱网/离线时
+# 拖慢迁移甚至报错。迁移前检测并提示用户。
+# 属性位常量（WinNT.h）：OFFLINE=0x1000 / RECALL_ON_OPEN=0x40000 /
+# RECALL_ON_DATA_ACCESS=0x400000
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_PLACEHOLDER_FLAGS = (_FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                      | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+_PLACEHOLDER_SCAN_LIMIT = 200  # 命中上限：防止超大目录扫描拖慢迁移
+
+
+def count_cloud_placeholder_files(root, limit=_PLACEHOLDER_SCAN_LIMIT):
+    """统计目录树中的云同步占位文件数（OneDrive 等）
+
+    用 GetFileAttributesW 逐文件查属性位（RECALL/OFFLINE），命中达 limit
+    即提前返回——该检查只在迁移前执行一次（后台线程），不能拖慢迁移。
+    返回 (count, 首个命中示例路径)；无命中返回 (0, "")；异常返回 (0, "")。
+    """
+    import ctypes
+    try:
+        get_attrs = ctypes.windll.kernel32.GetFileAttributesW
+        get_attrs.argtypes = [ctypes.c_wchar_p]
+        get_attrs.restype = ctypes.c_uint32
+    except Exception:
+        return 0, ""
+    count = 0
+    example = ""
+    try:
+        for _dirpath, _dirnames, filenames in os.walk(root):
+            for f in filenames:
+                full = os.path.join(_dirpath, f)
+                try:
+                    attrs = get_attrs(full)
+                except Exception:
+                    continue
+                if attrs != 0xFFFFFFFF and (attrs & _PLACEHOLDER_FLAGS):
+                    count += 1
+                    if not example:
+                        example = full
+                    if count >= limit:
+                        return count, example
+    except Exception:
+        return count, example
+    return count, example
 
 def is_symlink(path):
     """检测路径是否为符号链接/junction/重解析点
@@ -102,6 +154,21 @@ def is_symlink(path):
         if hasattr(st, 'st_reparse_tag') and st.st_reparse_tag != 0:
             return True
         return False
+    except Exception:
+        return False
+
+def is_junction(path):
+    """判断路径是否为 junction（目录联接，IO_REPARSE_TAG_MOUNT_POINT=0xA0000003）
+
+    与符号链接（IO_REPARSE_TAG_SYMLINK=0xA000000C）的区别：
+    junction 只能指向本地卷目录，常见于系统 XP 兼容链接（Local Settings 等）
+    和手动跨盘联接（如 .local → G:\\AI\\...）；
+    本工具迁移链接是 /D 符号链接优先（migrator._create_dir_link），
+    按此区分可过滤"非本工具迁移产物"的 junction。
+    """
+    try:
+        st = os.lstat(path)
+        return getattr(st, 'st_reparse_tag', 0) == 0xA0000003
     except Exception:
         return False
 
@@ -140,11 +207,15 @@ def is_system_path(path):
         for prefix in prefixes:
             if p.startswith(prefix):
                 return True
-        localappdata = os.environ.get("LOCALAPPDATA", "").lower().replace(bs, "/")
-        if localappdata and p.startswith(localappdata + "/microsoft/windows"):
-            return True
-        keywords = ["system32", "drivers", "driverstore", "windows defender",
-                    "windows security", "windowsapps", "servicing"]
+        # 注意：用户级 AppData\Local\Microsoft\Windows 下是 INetCache/Explorer
+        # 等用户级缓存，迁走（符号链接透明）不影响系统，不再标 [系统]
+        # 关键词只保留真系统位置在监控目录范围内的：
+        # - windows defender / windows security：C:\ProgramData\Microsoft\...（监控内）
+        # - windowsapps：C:\Program Files\WindowsApps（监控内）
+        # system32/drivers/driverstore/servicing 的真系统位置都在 C:\Windows 下
+        # （不在监控目录范围，且删除层已整体保护）；待迁移区命中它们只会
+        # 误标用户目录里的同名缓存/模拟目录（如 .wine\...\system32），故不列入
+        keywords = ["windows defender", "windows security", "windowsapps"]
         for kw in keywords:
             if kw in p:
                 return True
@@ -162,8 +233,8 @@ def _read_lnk_target(lnk_path):
         target = shortcut.Targetpath
         if target and target.lower().endswith('.exe'):
             return target
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
     return ""
 
 
@@ -245,7 +316,7 @@ def _match_registry_uninstall(dir_path, dir_name):
         #       会错配到第一个子产品（如 Adobe Creative Cloud），但 Adobe 是容器目录，
         #       应该走第19层 _detect_vendor_container 识别为"Adobe 容器目录"或子产品分拆
         # 通用容器目录（Programs/Package Cache 等）同理：
-        #       Programs 下有 Ollama/TRAE/Edge 等多个子产品，InstallLocation 父目录匹配
+        #       Programs 下有 Ollama/Edge 等多个子产品，InstallLocation 父目录匹配
         #       会错配到 Ollama version 0.32.0 等具体产品
         _VENDOR_CONTAINER_DIRS = {
             'adobe', 'google', 'mozilla', 'tencent', 'netease', 'ncsoft',
@@ -296,12 +367,12 @@ def _match_registry_uninstall(dir_path, dir_name):
                         install_loc = ""
                         try:
                             display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            log.debug("忽略异常: %s", e)
                         try:
                             install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            log.debug("忽略异常: %s", e)
                         if not display_name:
                             continue
                         # 双向匹配InstallLocation
@@ -332,8 +403,8 @@ def _match_registry_uninstall(dir_path, dir_name):
         if _is_generic_registry_text(best_match):
             return ""
         return best_match
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
     return ""
 
 def get_exe_version_info(exe_path):
@@ -430,7 +501,7 @@ _VENDOR_CONTAINER_DIRS_FOR_FEATURE = {
     # 2026-07-20 新增（返回空字符串的厂商容器目录）
     'bytedance', 'openai', 'purpledome', 'reckfeng', 'sentry', 'softdeluxe',
     # 通用容器目录（多软件共用，应走第19层厂商容器判定，不应绑定到具体产品）
-    # Programs: LocalAppData\Programs 下有多个软件（如 TRAE/Edge/GLM-PC 等）
+    # Programs: LocalAppData\Programs 下有多个软件（如 Edge/GLM-PC 等）
     # Package Cache: 多个 MSI 安装包缓存目录
     'programs', 'package cache',
 }
@@ -767,8 +838,8 @@ def _find_related_install(dir_path, dir_name, known_software_dirs=None):
                                 continue
                 finally:
                     winreg.CloseKey(key)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
         # 3. 扫描常见安装位置有没有同名目录（Program Files等）
         # 厂商容器目录跳过此扫描（Adobe 在 Program Files\Adobe 下有多子产品，但根目录读 exe 无意义）
@@ -791,8 +862,8 @@ def _find_related_install(dir_path, dir_name, known_software_dirs=None):
                             if info and not _is_generic_pe_text(info):
                                 return info
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         return ""
     except Exception:
@@ -935,12 +1006,12 @@ def _build_installed_index():
                             display_name = install_loc = ''
                             try:
                                 display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             try:
                                 install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             if display_name:
                                 index[display_name.lower()] = display_name
                                 if install_loc:
@@ -951,8 +1022,8 @@ def _build_installed_index():
                         continue
             finally:
                 winreg.CloseKey(key)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 1.5. DisplayName关键词索引（用于无InstallLocation的软件） ===
     # 很多注册表项只有DisplayName没有InstallLocation
@@ -978,8 +1049,8 @@ def _build_installed_index():
                             dn = ''
                             try:
                                 dn, _ = winreg.QueryValueEx(sk, 'DisplayName')
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             if dn and len(dn) >= 3:
                                 # 从DisplayName提取关键单词（如 "Microsoft Visual Studio 2022" →
                                 # "visual","studio","2022","visual studio","visualstudio"）
@@ -1024,8 +1095,8 @@ def _build_installed_index():
                         continue
             finally:
                 winreg.CloseKey(key)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 2. WMI InstalledWin32Program ===
     try:
@@ -1044,16 +1115,16 @@ def _build_installed_index():
                 install_loc = ''
                 try:
                     install_loc = item.InstallLocation or ''
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if name:
                     index[name.lower()] = name
                     if install_loc:
                         _add_path_segments(install_loc, name)
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 3. Windows Services ===
     try:
@@ -1073,8 +1144,8 @@ def _build_installed_index():
                 path = ''
                 try:
                     path = svc.PathName or ''
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if svc_name and display:
                     index[svc_name.lower()] = display
                 if path:
@@ -1083,8 +1154,8 @@ def _build_installed_index():
                         _add_path_segments(exe_dir, display if display else svc_name)
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 4. App Paths 注册表 ===
     try:
@@ -1114,18 +1185,18 @@ def _build_installed_index():
                                 default_val = ''
                                 try:
                                     default_val, _ = winreg.QueryValueEx(sub_key, '')
-                                except OSError:
-                                    pass
+                                except OSError as e:
+                                    log.debug("忽略异常: %s", e)
                                 if default_val and os.path.exists(default_val):
                                     _add_path_segments(default_val, exe_name[:-4])
                             finally:
                                 winreg.CloseKey(sub_key)
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            log.debug("忽略异常: %s", e)
             finally:
                 winreg.CloseKey(key)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 5. Program Files 深度扫描（2层，读所有exe的PE元数据）===
     install_roots = []
@@ -1157,8 +1228,8 @@ def _build_installed_index():
                                 _add_path_segments(top_path, info)
                                 found = True
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 # 深入一层子目录
                 if not found:
                     try:
@@ -1179,12 +1250,12 @@ def _build_installed_index():
                                             _add_path_segments(sub_path, info)
                                             found = True
                                             break
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                             if found:
                                 break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 # 深入二层子目录（第3层PE扫描）
                 if not found:
                     try:
@@ -1209,16 +1280,16 @@ def _build_installed_index():
                                                 _add_path_segments(sub2_path, info)
                                                 found = True
                                                 break
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("忽略异常: %s", e)
                                 if found:
                                     break
                             if found:
                                 break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     # === 6. UWP / MSIX 应用包注册（HKCU AppModel Repository） ===
     try:
@@ -1243,13 +1314,13 @@ def _build_installed_index():
                             display = ''
                             try:
                                 display, _ = winreg.QueryValueEx(sub, "DisplayName")
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             path = ''
                             try:
                                 path, _ = winreg.QueryValueEx(sub, "PackageRootFolder")
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
                             if display and path:
                                 _add_path_segments(path, display)
                             elif display:
@@ -1260,10 +1331,10 @@ def _build_installed_index():
                         continue
             finally:
                 winreg.CloseKey(pkg_key)
-        except OSError:
-            pass
-    except Exception:
-        pass
+        except OSError as e:
+            log.debug("忽略异常: %s", e)
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 7. Steam 游戏库扫描 ===
     # Steam 游戏不在注册表 Uninstall 里，需读 appmanifest_*.acf 获取游戏名
@@ -1280,8 +1351,8 @@ def _build_installed_index():
                     steam_install_dirs.append(_sp.replace('/', '\\'))
             finally:
                 _wr_steam.CloseKey(_k)
-        except OSError:
-            pass
+        except OSError as e:
+            log.debug("忽略异常: %s", e)
 
         for steam_dir in steam_install_dirs:
             steamapps = os.path.join(steam_dir, "steamapps")
@@ -1300,8 +1371,8 @@ def _build_installed_index():
                         _p = _m.group(1).replace("\\\\", "\\")
                         if _p and os.path.isdir(_p):
                             libs.append(os.path.join(_p, "steamapps"))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             # 3) 遍历每个库目录的 appmanifest_*.acf
             for lib in libs:
                 if not os.path.isdir(lib):
@@ -1329,10 +1400,10 @@ def _build_installed_index():
                                     index[_name_lower] = _name
                         except Exception:
                             continue
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
 
     # === 8. 扩展文件特征扫描（用于数据目录的无exe精确识别） ===
     # 增加更多通用文件指纹模式
@@ -1368,7 +1439,7 @@ def _match_installed_index(dir_name):
             return ""
         dl = dir_name.lower()
         # 厂商容器目录完全跳过此层（避免 Adobe/Tencent 等被错配到具体产品）
-        # 例：Tencent → StreamingService，cn.org.hermesagent.desktop → Docker Desktop
+        # 例：Tencent → StreamingService，cn.org.localagent.desktop → Docker Desktop
         # 这些目录应走第19层 _detect_vendor_container
         if dl in _VENDOR_CONTAINER_DIRS_FOR_FEATURE:
             return ""
@@ -1493,8 +1564,8 @@ def _winget_triple(pkg_id, db=None):
             if _i18n_en():
                 desc = entry.get("desc_en") or desc
             return (entry.get("name", ""), desc, entry.get("type", ""))
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
     return ()
 
 
@@ -1705,7 +1776,7 @@ def _match_winget_db(dir_name):
         # 4. 兜底：token 子集匹配（dir_name 所有单词都出现在 PackageName 中）
         # 使用驼峰分词：解决 PascalCase 目录名无法匹配带空格的软件名的问题
         # 反向域名包名（com.*/cn.*/dev.*/org.*/io.*）跳过此策略：
-        # 例：cn.org.hermesagent.desktop 不应按 token 子集匹配命中 "Docker Desktop"
+        # 例：cn.org.localagent.desktop 不应按 token 子集匹配命中 "Docker Desktop"
         #     com.pot-app.desktop 不应命中 "Docker Desktop"（pkg_id 后缀 desktop 误匹配）
         #     反向域名包名走第7层专门处理，winget 仅做精确匹配（策略 1/2/3）
         import re as _re_tok
@@ -1859,8 +1930,8 @@ def _detect_vendor_container(dir_path, dir_name):
                 entries = os.listdir(dir_path)
                 subdirs = [e for e in entries if os.path.isdir(os.path.join(dir_path, e))]
                 is_container = True
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         if not is_container:
             return ""
         # 1. 扫描子目录名匹配 KNOWN_SOFTWARE_DIRS
@@ -1883,8 +1954,8 @@ def _detect_vendor_container(dir_path, dir_name):
                             desc = KNOWN_SOFTWARE_DIRS[k]
                             if not _is_vague_desc_static(desc):
                                 return desc
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             # 2. 扫描子目录 PE 版本信息（最多扫 5 个子目录）
             # 注：强厂商容器黑名单跳过此层（避免 Adobe → "Adobe 创意云" 错配）
             scan_count = 0
@@ -1905,8 +1976,8 @@ def _detect_vendor_container(dir_path, dir_name):
                                 info = get_exe_version_info(os.path.join(subdir_path, entry))
                                 if info:
                                     return info
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                             break  # 每个子目录只试第一个 exe
                 except Exception:
                     continue
@@ -2019,8 +2090,8 @@ def _match_wmi_installed(dir_path, dir_name):
                 install_loc = ""
                 try:
                     install_loc = item.InstallLocation or ""
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if not name:
                     continue
                 # 情况1: InstallLocation 双向匹配
@@ -2106,15 +2177,15 @@ def _match_app_paths(dir_name):
                                         app_name, _ = winreg.QueryValueEx(sub_key, "AppName")
                                         if app_name:
                                             return app_name
-                                    except OSError:
-                                        pass
+                                    except OSError as e:
+                                        log.debug("忽略异常: %s", e)
                                     # 兜底用exe名（去掉.exe，首字母大写）
                                     if len(exe_base) > len(best_match):
                                         best_match = exe_base.capitalize()
                                 finally:
                                     winreg.CloseKey(sub_key)
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                log.debug("忽略异常: %s", e)
             finally:
                 winreg.CloseKey(key)
         return best_match
@@ -2180,8 +2251,8 @@ def _match_start_menu_lnk(dir_name):
                                 # node.exe 等用 Microsoft 工具链编译的exe PE CompanyName 会被标记为系统组件
                                 if info and not _is_generic_pe_text(info):
                                     return info
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                         # 兜底用lnk文件名
                         if len(lnk_base) > len(best_match):
                             best_match = f[:-4]
@@ -2348,8 +2419,8 @@ def _scan_subdir_for_exe_pe(dir_path, max_subdirs=10):
                         if info and not _is_generic_pe_text(info):
                             return info
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         return ""
     except Exception:
         return ""

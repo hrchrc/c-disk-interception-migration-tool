@@ -1030,7 +1030,7 @@ def search_online_description(dir_name, dir_path=""):
             text = cut
         return text.strip()
 
-    def _bing_search(query):
+    def _bing_search(query, content_ctx="", context=""):
         """必应搜索 — 纯规则生成搜索词，不包含任何目录名
 
         根据目录名特征自动选策略：
@@ -1040,6 +1040,8 @@ def search_online_description(dir_name, dir_path=""):
         - 含数字/版本号 → 剥掉版本号再搜
         - 反域名格式(cn.org.xxx) → 取最后两段
         - 默认 → "是什么文件夹"
+
+        content_ctx/context 为可选增强词（空则不插入，保持原行为）
         """
 
         def _build_search_terms(q):
@@ -1212,7 +1214,7 @@ def search_online_description(dir_name, dir_path=""):
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as _ex:
         _fut_baike = _ex.submit(lambda: _baidu_baike_search(name) or _baidu_baike_search(clean))
-        _fut_bing = _ex.submit(lambda: _bing_search(clean))
+        _fut_bing = _ex.submit(lambda: _bing_search(clean, context=dir_path))
         _fut_bing_kg = _ex.submit(lambda: _bing_knowledge(clean))
         _fut_wiki = _ex.submit(lambda: (_wiki_search('zh', clean), _wiki_summary('zh', _wiki_search('zh', clean) or clean)))
         try:

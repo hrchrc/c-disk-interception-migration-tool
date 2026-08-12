@@ -14,12 +14,12 @@ from pathlib import Path
 from datetime import datetime
 
 APP_NAME = "C盘拦迁器"
-APP_VERSION = "0.02"
+APP_VERSION = "0.03"
 
 # #28:配置文件版本号(config.json/state.json 各自独立版本,结构变更时递增,
 # 加载时检查:文件版本高于程序支持→警告降级加载;低于→执行迁移扩展点)
-CONFIG_VERSION = 1
-STATE_VERSION = 1
+CONFIG_VERSION = 2  # 2026-08-12: 新增 user_dir_notify_enabled 配置字段
+STATE_VERSION = 2  # 2026-08-12: 新增 dst_index 状态字段
 
 # 单实例 Mutex handle（main() 中创建，_restart_app 中释放）
 # 放在 config 模块而非 main 模块，因为 ui_lifecycle 已经 import config，
@@ -112,6 +112,7 @@ CONFIG_FIELDS = {
     "g_root", "scan_interval", "auto_migrate", "size_threshold",
     "auto_clean_vss", "ai_recognize", "whitelist", "removed_default_whitelist",
     "verify_hash", "copy_threads", "copy_threads_auto",  # P5/P10 用户选项:复制校验开关/线程数(须落盘保存)
+    "user_dir_notify_enabled",  # 用户目录写入提醒（右下角气泡）
     "config_version",  # #28:配置文件版本号(结构变更时递增,加载时检查)
 }
 
@@ -131,6 +132,7 @@ STATE_FIELDS = {
     "logged_symlinks",     # 链接日志去重列表
     "blocked_processes",   # 拦截记录
     "deleted_links",       # 删除链接恢复线索 [{src, dst, time, file_count, size_mb}]
+    "dst_index",           # 已迁移目标目录轻量索引（跨盘校对值，后台构建，可重建）
     "state_version",       # #28:状态文件版本号(结构变更时递增,加载时检查)
 }
 
@@ -145,6 +147,7 @@ DEFAULT_CONFIG = {
     "copy_threads": 12,    # P5 用户选项:复制/校验线程数(手动输入,上限=CPU 逻辑线程数)
     "copy_threads_auto": True,  # P10:线程数自动分级(按 CPU 逻辑线程数低/中/高端,默认开)
     "auto_clean_vss": False,  # 迁移/还原后自动清理 VSS 卷影副本（2026-08-09 改默认关：会删除系统所有还原点，软迁移不依赖它，开启需用户明确选择）
+    "user_dir_notify_enabled": True,  # 用户目录写入提醒（右下角气泡，默认开；气泡点"不再提醒"或界面开关可关闭）
     "whitelist": [],  # 用户白名单（放行的安装命令）
     "removed_default_whitelist": [],  # 用户删除的默认白名单关键词（重启后不再生效）
     # AI 联网识别配置（API Key 不在此处存储，独立保存到 ai_keys.json）

@@ -44,6 +44,8 @@ from mft_reader import (
     MftReader, MftError, MftPermissionError, MftNotNtfsError,
     is_admin, _ref_number_to_mft_num,
 )
+from scan_dirs import (get_scan_dirs, get_monitored_base_norms, get_known_folder_paths,
+                       is_user_dir_excluded, norm_path, USER_LABEL)
 
 # 真实 MftReader 引用：测试注入 mock（如 test_mft_compact.py 的 FakeReader）
 # 替换 fast_scan.MftReader 时，Rust 分支必须跳过（避免启动真实引擎读卷
@@ -64,13 +66,13 @@ def _cleanup_mft_tmp_at_exit():
     for s in list(_ACTIVE_SCANNERS):
         try:
             s._close_rust_mm()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
     for p in list(_PENDING_TMP):
         try:
             os.remove(p)
-        except OSError:
-            pass
+        except OSError as e:
+            log.debug("忽略异常: %s", e)
 
 
 atexit.register(_cleanup_mft_tmp_at_exit)
@@ -112,8 +114,8 @@ def _get_dir_size_walk_bytes(path):
             for f in filenames:
                 try:
                     total += os.path.getsize(os.path.join(dirpath, f))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
         return total
     except Exception:
         return 0
@@ -303,8 +305,8 @@ class MftScanner:
             if self._reader is not None:
                 try:
                     self._reader.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             self._reader = None
             self._reset_index()
             self._fallback = True
@@ -407,8 +409,8 @@ class MftScanner:
             if proc:
                 try:
                     proc.kill()
-                except OSError:
-                    pass
+                except OSError as e:
+                    log.debug("忽略异常: %s", e)
 
         timeout_timer = threading.Timer(120, _on_timeout)
         timeout_timer.daemon = True
@@ -420,8 +422,8 @@ class MftScanner:
                 try:
                     for line in proc.stderr:
                         stderr_lines.append(line)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         t = threading.Thread(target=_drain_stderr, daemon=True)
         t.start()
@@ -457,8 +459,8 @@ class MftScanner:
                 timeout_timer.cancel()
             try:
                 proc.wait()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             t.join(timeout=5)
 
         rc = proc.returncode if proc.returncode is not None else -1
@@ -610,12 +612,12 @@ class MftScanner:
             # 失败路径释放 mmap，避免句柄/映射泄漏
             try:
                 mm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             try:
                 os.close(mm_fd)
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
             raise
 
         self._mm = mm
@@ -636,15 +638,15 @@ class MftScanner:
             self._rec_names = b""
             try:
                 mm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             self._mm = None
         fd = getattr(self, "_mm_fd", -1)
         if fd >= 0:
             try:
                 os.close(fd)  # 句柄已由 mm close 关闭，仅释放 CRT fd 表项
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
             self._mm_fd = -1
         # 补删 mmap 打开期间未能删除的临时索引文件（映射关闭后解除锁定）
         pending = getattr(self, "_pending_tmp", None)
@@ -963,25 +965,19 @@ class MftScanner:
         return results
 
     def scan_six_dirs(self, progress_cb=None):
-        """扫描六个监控目录的所有一级子目录。
+        """扫描监控目录的所有一级子目录（6 个目录 + 当前用户目录）。
 
         兼容主项目 scan_appdata 的返回格式（子集）：
             {"path", "name", "location", "size_mb"}
 
-        性能目标：六个目录全部一级子目录 < 2 秒
+        性能目标：全部一级子目录 < 2 秒
         """
-        local_appdata = os.environ.get("LOCALAPPDATA", "")
-        appdata = os.environ.get("APPDATA", "")
-        scan_dirs = [
-            (local_appdata, "Local"),
-            (os.path.join(local_appdata, "Programs"), "Programs"),
-            (appdata, "Roaming"),
-            (r"C:\Program Files", "Program Files"),
-            (r"C:\Program Files (x86)", "Program Files (x86)"),
-            (r"C:\ProgramData", "ProgramData"),
-        ]
+        scan_dirs = get_scan_dirs()
+        # 用户目录一级子目录的动态排除集合：已监控 base + 系统特殊文件夹（Known Folder API）
+        _user_dir_monitored = get_monitored_base_norms(scan_dirs)
+        _user_dir_known = get_known_folder_paths()
 
-        # 先收集所有候选（六个目录的一级子目录）
+        # 先收集所有候选（各目录的一级子目录）
         all_candidates = []
         for base_path, label in scan_dirs:
             if not base_path or not os.path.exists(base_path):
@@ -993,11 +989,15 @@ class MftScanner:
                         full_path = os.path.join(base_path, entry)
                         if not os.path.isdir(full_path):
                             continue
+                        # 用户目录下：动态排除已监控子目录与系统特殊文件夹
+                        if label == USER_LABEL and is_user_dir_excluded(
+                                norm_path(full_path), _user_dir_monitored, _user_dir_known):
+                            continue
                         if _is_reparse_point(full_path):
                             continue
                         all_candidates.append((full_path, entry, label))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             else:
                 # MFT 模式：通过索引获取子目录（零磁盘 I/O）
                 idx = self._resolve_path(base_path)
@@ -1011,6 +1011,10 @@ class MftScanner:
                         continue
                     name = self._name_of(child_idx)
                     full_path = os.path.join(base_path, name)
+                    # 用户目录下：动态排除已监控子目录与系统特殊文件夹
+                    if label == USER_LABEL and is_user_dir_excluded(
+                            norm_path(full_path), _user_dir_monitored, _user_dir_known):
+                        continue
                     all_candidates.append((full_path, name, label))
 
         # 计算每个候选目录的大小
@@ -1160,8 +1164,8 @@ class MftScanner:
         # 防止调用方未 close 时映射句柄/临时文件泄漏
         try:
             self._close_rust_mm()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     @property
     def is_mft_mode(self):
@@ -1182,8 +1186,8 @@ class MftScanner:
                     continue
                 size_mb = _get_dir_size_walk(full_path)
                 results.append({"path": full_path, "name": entry, "size_mb": size_mb})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         results.sort(key=lambda x: x["size_mb"], reverse=True)
         return results
 

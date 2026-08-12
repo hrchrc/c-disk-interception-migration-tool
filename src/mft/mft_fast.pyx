@@ -158,7 +158,7 @@ def parse_record_attributes(bytearray record_data):
             if attr_len < 0x40:
                 break
             run_list_offset = _read_u16(buf + pos + 0x20)
-            real_size = _read_u64(buf + pos + 0x30)
+            real_size = _read_u64(buf + pos + 0x28)  # 0x28=AllocatedSize (real disk usage)
             attrs[attr_type] = (True, None, None, pos + run_list_offset, real_size)
         pos += attr_len
     return attrs, flags
@@ -333,7 +333,7 @@ def parse_records_bulk(bytearray bulk, int bytes_per_record, int bytes_per_secto
                     # 非驻留属性头至少 0x40 字节(读 pos+0x30 需 pos+0x38<=n)
                     if attr_len < 0x40:
                         break
-                    data_real_size = _read_u64(rec + pos + 0x30)
+                    data_real_size = _read_u64(rec + pos + 0x28)  # 0x28=AllocatedSize (real disk usage)
                     is_non_resident_data = True
                 has_data = True
             elif attr_type == ATTR_REPARSE_POINT:

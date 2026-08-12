@@ -1,64 +1,72 @@
-# ===== Python 缓存与构建产物 =====
+# ===== 本地配置/日志/缓存（含运行时数据，不上传） =====
+config.json
+ai_keys.json
+state.json
+logs/
+backup/
+/data/
+dev_env_snapshots/
+识别记录.json
+*.log
+# 本地启动脚本（开发期辅助，打包 exe 后无需）
+*.bat
+# Python 升级脚本（含本地用户名路径，不上传）
+upgrade_python_*.ps1
+
+# ===== PyInstaller 构建产物 =====
+build/
+dist/
+*.spec
+
+# ===== Python 缓存 =====
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
-build/
-dist/
 
 # ===== 虚拟环境 =====
 venv/
 .venv/
 env/
 
-# ===== IDE 与系统文件 =====
+# ===== IDE 配置 =====
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# ===== 系统文件 =====
 Thumbs.db
 desktop.ini
 .DS_Store
 
-# ===== 日志 =====
-logs/
-*.log
+# ===== 本地文档（私人，不上传） =====
+*.docx
 
-# ===== 本地运行时配置（含用户敏感数据，勿提交） =====
-config.json
-state.json
-ai_keys.json
-ai_recognize_cache.json
-识别记录.json
-
-# ===== 运行时数据目录 =====
-dev_env_snapshots/
-
-# ===== 打包配置与本机辅助脚本 =====
-*.spec
-*.bat
-
-# ===== 打包产物（release 单独发布，不混入源码仓库）=====
-/C盘拦迁器.exe
-/data/
-
-# ===== 大体积测试数据与构建产物 =====
-ceshiwenjian/
-rust-engine/target/
-src/mft/mft_fast.c
-*.test_bak
+# ===== 数据生成中间产物（私人，不上传） =====
 _china_sw_expand/
 winget-tmp/
-
-# ===== 数据备份（勿提交） =====
+scoop-proxy-cn-sync/
+scoop-proxy-cn-sync.zip
 *.bak
 *.backup_*
 *.bak_*
 
-# ===== 本地文档（私人，勿提交） =====
-*.docx
+# ===== 开发期临时测试/诊断脚本（含本地路径，不上传） =====
+src/_*.ps1
+src/tests/data/
+src/tests/logs/
 
-# ===== 本地开发工具私有目录 =====
-.gitnexus/
+
+# ===== Rust 构建产物（曾导致 git 未跟踪列表被数万个文件刷屏） =====
+rust-engine/target/
+
+# ===== 发布补充清单实测遗漏项 =====
+ceshiwenjian/
 .openclaw/
+src/mft/mft_fast.c
+*.test_bak
+ai_recognize_cache.json
+rust-engine/bench*.log
+docs/decisions.md

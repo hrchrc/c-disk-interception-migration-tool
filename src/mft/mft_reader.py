@@ -602,7 +602,7 @@ class MftReader:
                                     None, content_length)
             else:
                 run_list_offset = struct.unpack_from("<H", record_data, pos + 0x20)[0]
-                real_size = struct.unpack_from("<Q", record_data, pos + 0x30)[0]
+                real_size = struct.unpack_from("<Q", record_data, pos + 0x28)[0]  # 0x28=AllocatedSize(实际占用)
                 attrs[attr_type] = (True, None, None, pos + run_list_offset, real_size)
             pos += attr_len
         return attrs, flags

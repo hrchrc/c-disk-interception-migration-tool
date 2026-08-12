@@ -22,6 +22,41 @@ import threading
 import time
 from pathlib import Path
 
+# ========== 长路径安全化 ==========
+# Windows API 对 \\?\ 前缀向下兼容：深层嵌套目录（node_modules 等）路径超过
+# 260 字符时，无前缀会在 CreateFileW 层直接失败（ERROR_PATH_NOT_FOUND），
+# 除非系统手动开启了 Win32 长路径组策略（默认关闭）。
+# 给引擎 job 的 source/target 统一加前缀后，任意深度路径都可正常工作。
+# 注意：\\?\ 是 Windows API 强制语法（无法用正斜杠替代），此处作为常量；
+# 其余新代码路径处理一律用 pathlib / 正斜杠（防斜杠规范）。
+_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def _with_long_path_prefix(path):
+    """长路径安全化：给本地盘符绝对路径加 \\?\\ 前缀（幂等，短路径也正常）
+
+    - 已带前缀 / UNC（\\\\server\\share 或 //server/share）/ 相对路径 → 原样返回
+    - 本地绝对路径（X:\\... 或 X:/...）→ 加前缀，并统一为反斜杠分隔符
+    """
+    try:
+        p = os.fspath(path) if not isinstance(path, str) else path
+        if not p or p.startswith(_LONG_PATH_PREFIX):
+            return path
+        pp = Path(p)
+        if not pp.is_absolute():
+            return path  # 相对路径不加（引擎内部可能基于 cwd 解析）
+        drive = pp.drive
+        if not drive:
+            return path  # 无盘符（如 / 根）不加
+        # UNC 网络路径不加（引擎有 network_path 独立处理）；正斜杠/反斜杠形式都判
+        if drive.startswith("//") or drive.startswith("\\\\"):
+            return path
+        # 统一反斜杠分隔符（str(Path) 在 Windows 上转反斜杠），
+        # 避免 \\?\C:/x 混合分隔符
+        return _LONG_PATH_PREFIX + str(pp)
+    except Exception:
+        return path
+
 # 模块级 logger(与 migrator/config 共用 CDriveRelocator,写入 app.log)
 log = logging.getLogger('CDriveRelocator')
 
@@ -203,12 +238,14 @@ class MigrateEngine:
         # 确保起始状态干净(上次异常残留)
         try:
             os.remove(cancel_token)
-        except OSError:
-            pass
+        except OSError as e:
+            log.debug("忽略异常: %s", e)
 
         job = {
-            "source": str(source),
-            "target": str(target),
+            # 长路径安全化：统一加 \\?\ 前缀，
+            # 深层目录超 260 字符不再在 CreateFileW 层失败
+            "source": _with_long_path_prefix(str(source)),
+            "target": _with_long_path_prefix(str(target)),
             "mode": mode,
             "verify": verify,
             "retry": {
@@ -240,8 +277,8 @@ class MigrateEngine:
             for p in (job_path, cancel_token):
                 try:
                     os.remove(p)
-                except OSError:
-                    pass
+                except OSError as e:
+                    log.debug("忽略异常: %s", e)
 
     def run_job_sync(self, source, target, mode="copy", **kwargs):
         """同步便捷封装(无事件回调),等待完成返回退出码。
@@ -260,8 +297,8 @@ class MigrateEngine:
         if token:
             try:
                 Path(token).touch()
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
         # 不在此处 wait/terminate:与 _spawn_and_drain 的 stdout 读循环并发会竞争
         # (subprocess.wait 非线程安全,两个线程同时 wait 同一进程可能 OSError)。
         # 引擎收到 cancel_token 后会在下个块边界(<4MB,通常 <1 秒)发 Cancelled 事件并退出,
@@ -276,8 +313,8 @@ class MigrateEngine:
         if proc is not None:
             try:
                 proc.kill()
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
 
     def wait_exit(self, timeout):
         """等待引擎进程退出(优雅取消后引擎需时间 save ckpt 并退出)。
@@ -360,6 +397,11 @@ class MigrateEngine:
                     # 记录解析失败行(截断防止超长行污染诊断)
                     parse_errors.append("%s: %s" % (e, line[:200]))
                     continue
+                # 显示层剥离 \\?\ 前缀：引擎 job 的 source/target 加了前缀
+                # （4.1 长路径），事件输出会带，UI 日志/诊断无需显示该前缀
+                if _LONG_PATH_PREFIX in line:
+                    evt = {k: (v.replace(_LONG_PATH_PREFIX, "") if isinstance(v, str) else v)
+                           for k, v in evt.items()}
                 # 检测 job_done 事件(用于判断进程是否正常完成)
                 if evt.get("event") == "job_done":
                     has_job_done = True
@@ -388,8 +430,8 @@ class MigrateEngine:
                 timeout_timer.cancel()
             try:
                 self._proc.wait()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             t.join(timeout=5)
             # 线程仍活着时保留已收集的 stderr(用于诊断),不丢弃
             rc = self._proc.returncode if self._proc.returncode is not None else -1
@@ -478,8 +520,8 @@ class MigrateEngine:
                 size = os.path.getsize(log_path)
                 if size > 1_000_000:
                     os.remove(log_path)
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("忽略异常: %s", e)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(content)
             # 同时写入 app.log(让软件内可见),前缀 [rust-engine] 标识来源

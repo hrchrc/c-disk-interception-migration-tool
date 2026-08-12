@@ -14,8 +14,11 @@ from datetime import datetime
 import logging
 log = logging.getLogger('CDriveRelocator')
 from config import save_config, save_all, log_link_operation, log_error_with_reason
-from utils import is_symlink, get_symlink_target, get_dir_size_fast, link_fix_locked
+from utils import (is_symlink, is_junction, get_symlink_target, get_dir_size_fast,
+                   link_fix_locked, count_cloud_placeholder_files)
 from software_detect import get_dir_description
+from scan_dirs import (get_scan_dirs, get_monitored_base_norms, get_known_folder_paths,
+                       is_user_dir_excluded, norm_path, USER_LABEL)
 
 # Windows 下调用子进程时不弹黑框的标志
 _NO_WINDOW_FLAGS = 0x08000000
@@ -111,8 +114,8 @@ def _get_migrated_desc(src_path, config=None):
                 for k, v in desc_cache.items():
                     if _norm(k) == norm_parent:
                         return v
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
     # 4. 兜底用目录名
     try:
         return os.path.basename(src_path.rstrip("\\/"))
@@ -149,8 +152,8 @@ def query_vss_usage():
             parts = ret.stdout.strip().split()
             if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                 return int(parts[0]), int(parts[1])
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("忽略异常: %s", e)
     return 0, 0
 
 
@@ -172,8 +175,8 @@ def clean_vss_shadows():
         try:
             import shutil
             before_free = shutil.disk_usage("C:\\").free
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
         # 方案1：PowerShell Remove-CimInstance（推荐，无需确认）
         # 用 try/catch 包裹：Remove-CimInstance 失败时 exit 1，避免 returncode 恒 0 误判
@@ -204,8 +207,8 @@ def clean_vss_shadows():
             after_free = 0
             try:
                 after_free = shutil.disk_usage("C:\\").free
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             freed_mb = max(0, (after_free - before_free) // 1024 // 1024)
             return True, count, freed_mb
 
@@ -220,8 +223,8 @@ def clean_vss_shadows():
             after_free = 0
             try:
                 after_free = shutil.disk_usage("C:\\").free
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             freed_mb = max(0, (after_free - before_free) // 1024 // 1024)
             return True, -1, freed_mb  # vssadmin 不返回数量，用 -1 表示未知
 
@@ -286,7 +289,7 @@ _FORBIDDEN_RD_PATHS = frozenset([
     r"C:\USERS", r"C:\RECOVERY", r"C:\SYSTEM VOLUME INFORMATION",
 ])
 # C:\WINDOWS 整棵子树(SYSTEM32 等)也拒绝;其余关键路径只精确拒绝本身,
-# 不误伤其子目录(C:\Users\aaa\... 是正常迁移范围)。
+# 不误伤其子目录(C:\Users\xxx\... 是正常迁移范围)。
 _FORBIDDEN_RD_PREFIXES = (r"C:\WINDOWS",)
 
 # Restart Manager (rstrtmgr.dll) 句柄模块级缓存(P6 审查修复):
@@ -295,6 +298,11 @@ _FORBIDDEN_RD_PREFIXES = (r"C:\WINDOWS",)
 # 进程内复用同一句柄只加载一次,退出时由解释器统一清理。
 _RM_DLL = None
 _RM_DLL_LOCK = threading.Lock()
+# 已迁移目标目录轻量索引（dst_index）的并发保护锁：
+# 异步构建线程（_add_migrated_record 后台）与 remove_dst_index / build_all
+# 都会"读-改-写" cfg["dst_index"]，无锁时批量迁移会丢索引条目（竞态）。
+# 注意：锁内只做快速 dict 操作与写盘，慢遍历必须在锁外。
+_DST_INDEX_LOCK = threading.Lock()
 
 
 def _get_rm_dll():
@@ -306,6 +314,58 @@ def _get_rm_dll():
             if _RM_DLL is None:
                 _RM_DLL = ctypes.WinDLL("rstrtmgr.dll")
     return _RM_DLL
+
+
+def _validate_migration_paths(src_path, dst_path):
+    """迁移路径安全校验：src==dst / 包含关系（防止镜像同步自毁）
+
+    镜像同步（/MIR）会复制到自身内部，清空源时连带目标一起删除。
+    判定逻辑从 migrate() 提取为独立函数，行为可单测。
+    返回 (ok: bool, err_msg: str)；ok=True 通过。
+    不同盘符的 commonpath 抛 ValueError，不算包含关系。
+    """
+    _norm_src = os.path.normcase(os.path.normpath(str(src_path)))
+    _norm_dst = os.path.normcase(os.path.normpath(str(dst_path)))
+    if _norm_src == _norm_dst:
+        return False, (f"源路径和目标路径相同，无法迁移：\n"
+                       f"  {src_path}\n"
+                       f"请选择不同的目标路径。")
+    try:
+        _common = os.path.commonpath([_norm_src, _norm_dst])
+        if _common == _norm_src or _common == _norm_dst:
+            return False, (f"源路径和目标路径存在包含关系，可能导致数据全毁：\n"
+                           f"  源: {src_path}\n"
+                           f"  目标: {dst_path}\n"
+                           f"镜像同步会复制到自身内部，清空源时连带目标一起删除。\n"
+                           f"请选择不同的目标路径。")
+    except ValueError:
+        pass  # 不同盘符，commonpath 抛 ValueError，不算包含
+    return True, ""
+
+
+def build_dev_env_paths(cfg):
+    """开发环境已配置的 C 盘源路径索引（用于待迁移区橙色提示）
+
+    dev_env_configured 结构: {tool_id: {source_path, target_drive, target_path, name, ...}}
+    同一个 C 盘源路径可能被多个工具配置（如 npm_global 和 npm_cache 都在 %APPDATA%\npm 下），
+    这里以源路径为 key 建索引，匹配到任一即标橙。
+    scan_appdata 与 SmartScanWorker（智能刷新）共用，保证两条路径行为一致。
+    """
+    dev_env_paths = {}  # {normalized_source_path: {name, target_drive, target_path}}
+    if not cfg:
+        return dev_env_paths
+    for tid, info in (cfg.get("dev_env_configured") or {}).items():
+        sp = (info or {}).get("source_path", "")
+        if not sp:
+            continue
+        # 规范化：去 \\?\ 前缀，小写，去末尾反斜杠
+        sp_norm = sp.replace("\\\\?\\", "").lower().rstrip("\\")
+        dev_env_paths[sp_norm] = {
+            "name": info.get("name", ""),
+            "target_drive": info.get("target_drive", ""),
+            "target_path": info.get("target_path", ""),
+        }
+    return dev_env_paths
 
 
 class Migrator:
@@ -349,8 +409,8 @@ class Migrator:
         if self.log_callback:
             try:
                 self.log_callback(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _maybe_clean_vss(self):
         """迁移/还原后处理 VSS 卷影副本（v2：默认非破坏，2026-08-09）
@@ -373,16 +433,16 @@ class Migrator:
                         f"  ℹ️ 检测到系统还原点占用 {used_mb}MB（可能含已迁移数据的旧版本）。"
                         f"如需释放 C 盘空间，可在顶部设置勾选「迁移后清理还原点」"
                         f"（会删除系统所有还原点）。")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             return
         # 用户主动开启自动清理：#29 首次警示(仅一次,记忆到 cfg)
         if not self.cfg.get("vss_clean_warned", False):
             self.cfg["vss_clean_warned"] = True
             try:
                 save_all(self.cfg)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             self._emit_log("warn",
                 "  ⚠️ 即将自动清理 VSS 卷影副本——这会删除系统上所有的还原点！\n"
                 "     如需保留还原点，请在设置中关闭“自动清理 VSS 卷影副本”选项。")
@@ -415,8 +475,8 @@ class Migrator:
                 m for m in self.cfg.get("migrated", [])
                 if os.path.normpath(m.get("src", "")).lower() != _src_norm
             ]
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         record = {
             "src": str(src), "dst": str(dst),
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -424,19 +484,200 @@ class Migrator:
             "desc": desc if desc is not None else _get_migrated_desc(str(src), self.cfg),
         }
         self.cfg["migrated"].append(record)
+        # 跨盘目标（MFT 未覆盖）：迁移/恢复完成后异步构建轻量索引
+        # （后台线程，不阻塞调用线程；数秒内索引就绪，删除记录/恢复对话框
+        # 直接用，无需等下次启动的 build_all 兜底）
+        try:
+            if not self._mft_covers(str(dst)):
+                import threading as _th
+                _dst_key = str(dst).replace("\\", "/").lower().rstrip("/")
+                _dst_str = str(dst)
+
+                def _bg_build():
+                    entry = self._build_dst_index(_dst_str)
+                    if entry:
+                        try:
+                            with _DST_INDEX_LOCK:
+                                idx = dict(self.cfg.get("dst_index") or {})
+                                idx[_dst_key] = entry
+                                # 内存更新即可；落盘由 build_all（下次启动）兜底，
+                                # 避免后台线程并发写盘覆盖 state.json 其他字段
+                                self.cfg["dst_index"] = idx
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
+
+                _th.Thread(target=_bg_build, daemon=True).start()
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
+
+    def _mft_covers(self, path):
+        """路径是否在当前 MFT 扫描器覆盖的卷（仅该卷可毫秒级计算大小/文件数）
+
+        跨盘目标（如迁移到 G 盘的目录）MFT 索引不覆盖，
+        此时 _count_files_fast / get_dir_size_fast 会回退 rglob/os.walk
+        全量磁盘遍历（大目录卡数秒），删除记录/恢复对话框等即时操作必须避免。
+        """
+        try:
+            from utils import get_mft_scanner
+            scanner = get_mft_scanner()
+            if scanner is None or not getattr(scanner, "_loaded", False):
+                return False
+            p = str(path)
+            drive = p[:1].upper() if len(p) >= 2 and p[1] == ":" else ""
+            return bool(drive) and drive == getattr(scanner, "volume", "").upper()
+        except Exception:
+            return False
+
+    # ========== 已迁移目标目录轻量索引（跨盘校对值，防删除记录/恢复卡顿）==========
+    # MFT 索引只覆盖 C 盘卷；已迁移目标在 D/G 盘，实时统计会全量遍历磁盘。
+    # 对已迁移目标目录建轻量索引（文件数+总大小+目录mtime），存 state.json：
+    # 删除记录/恢复对话框直接查索引比对（毫秒级），迁移记录移除时删除索引。
+    # 索引在后台线程构建（build_all_dst_indexes），不卡 UI；可随时重建。
+
+    def _get_dst_index(self, dst):
+        """查已迁移目标目录的轻量索引（无则 None）"""
+        try:
+            idx = self.cfg.get("dst_index") or {}
+            key = str(dst).replace("\\", "/").lower().rstrip("/")
+            return idx.get(key)
+        except Exception:
+            return None
+
+    def _build_dst_index(self, dst):
+        """构建单个目标目录的轻量索引（文件数+总大小+目录 mtime）
+
+        全量磁盘遍历（os.walk），必须在后台线程调用；失败返回 None 不中断。
+        """
+        try:
+            file_count = 0
+            total = 0
+            for _dirpath, _dirnames, filenames in os.walk(dst):
+                for f in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(_dirpath, f))
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
+                    file_count += 1
+            try:
+                mtime = os.path.getmtime(dst)
+            except Exception:
+                mtime = 0
+            return {
+                "file_count": file_count,
+                "size_mb": round(total / 1024 / 1024, 6),
+                "mtime": mtime,
+                "built_at": time.time(),
+            }
+        except Exception:
+            return None
+
+    def build_all_dst_indexes(self, max_age=86400):
+        """后台构建所有已迁移目标目录的轻量索引（启动时调用，不卡 UI）
+
+        - 只对 MFT 未覆盖的跨盘目标构建；已存在且新鲜（max_age 秒内）的跳过
+        - 清理孤儿：已不在迁移记录里的索引删除（记录移除 → 索引删除）
+        - 构建阶段（os.walk 遍历）在锁外执行，提交阶段（dict 合并+写盘）
+          在 _DST_INDEX_LOCK 内——锁内只有快速操作，不会阻塞 UI 线程
+          （如删除记录时 remove_dst_index 也要拿锁）
+        - 写盘用读-改-写只更新 dst_index 字段，读取失败只更新内存不写盘
+          （2026-08-11 事故教训：防止覆盖 state.json 其他字段）
+        :return: 索引条目数（0=异常/无可建）
+        """
+        try:
+            from config import STATE_FILE
+            import json as _json
+            migrated_dsts = set()
+            for m in self.cfg.get("migrated", []):
+                d = m.get("dst") or ""
+                if d:
+                    migrated_dsts.add(str(d).replace("\\", "/").lower().rstrip("/"))
+            # ===== 构建阶段（无锁，耗时遍历）=====
+            built = {}
+            now = time.time()
+            for m in self.cfg.get("migrated", []):
+                dst = m.get("dst")
+                if not dst:
+                    continue
+                if self._mft_covers(dst):
+                    continue  # MFT 覆盖卷毫秒级实时算，无需索引
+                key = str(dst).replace("\\", "/").lower().rstrip("/")
+                old = (self.cfg.get("dst_index") or {}).get(key)
+                if old and now - old.get("built_at", 0) < max_age:
+                    continue  # 新鲜，跳过
+                entry = self._build_dst_index(dst)
+                if entry:
+                    built[key] = entry
+            # ===== 提交阶段（加锁，快速操作）=====
+            with _DST_INDEX_LOCK:
+                idx = dict(self.cfg.get("dst_index") or {})
+                changed = False
+                if built:
+                    idx.update(built)
+                    changed = True
+                # 清理孤儿（迁移记录已移除的目录）
+                for key in [k for k in idx if k not in migrated_dsts]:
+                    del idx[key]
+                    changed = True
+                if changed:
+                    self.cfg["dst_index"] = idx
+                    # 读-改-写：只更新 dst_index 字段，避免并发覆盖其他字段
+                    disk = None
+                    try:
+                        with open(STATE_FILE, "r", encoding="utf-8") as f:
+                            disk = _json.load(f)
+                    except Exception:
+                        disk = None
+                    if disk is not None:
+                        disk["dst_index"] = idx
+                        try:
+                            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                                _json.dump(disk, f, ensure_ascii=False, indent=2)
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
+            return len(idx)
+        except Exception:
+            return 0
+
+    def remove_dst_index(self, dst):
+        """迁移记录移除后删除对应索引条目（记录移除 → 索引删除）"""
+        try:
+            with _DST_INDEX_LOCK:
+                idx = dict(self.cfg.get("dst_index") or {})
+                key = str(dst).replace("\\", "/").lower().rstrip("/")
+                if key in idx:
+                    del idx[key]
+                    self.cfg["dst_index"] = idx
+                    try:
+                        from config import save_state
+                        save_state(self.cfg)
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def record_deleted_link(self, src, dst):
         """删除链接后记录恢复线索（校对值=文件数+总大小，MFT 毫秒级），供恢复使用。
 
         只记 src/dst/时间/校对值，不删除任何数据；失败不阻断删除流程（调用方捕获）。
         校对值用 MFT 索引（_count_files_fast + get_dir_size_fast），
-        删除链接操作零卡顿；清空/替换/增删文件均可检出。
+        MFT 覆盖卷内毫秒级；跨盘目标（MFT 不覆盖）跳过校对值计算（记 0），
+        避免 rglob/os.walk 全量遍历导致"删除记录"卡顿——删除操作必须零等待。
         """
         try:
             if is_symlink(dst):
                 return False, "目标盘路径是符号链接，无法记录"
-            file_count = self._count_files_fast(dst)
-            size_mb = get_dir_size_fast(dst)
+            if self._mft_covers(dst):
+                file_count = self._count_files_fast(dst)
+                size_mb = get_dir_size_fast(dst)
+            else:
+                # 跨盘目标：优先用轻量索引（后台构建，毫秒级），无索引记 0
+                entry = self._get_dst_index(dst)
+                if entry:
+                    file_count = entry.get("file_count", 0)
+                    size_mb = entry.get("size_mb", 0)
+                else:
+                    file_count = 0
+                    size_mb = 0
             rec = {
                 "src": str(src), "dst": str(dst),
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -468,11 +709,43 @@ class Migrator:
                 item["current"] = None
                 result.append(item)
                 continue
-            cur_fc = self._count_files_fast(dst)
+            cur_fc = self._count_files_fast(dst) if self._mft_covers(dst) else None
+            if cur_fc is None:
+                # 跨盘目标（MFT 未覆盖）：优先用轻量索引比对（后台构建，不卡），
+                # 无索引则快速非空检查
+                item["current"] = None
+                entry = self._get_dst_index(dst)
+                if entry and entry.get("file_count"):
+                    cur_fc = entry.get("file_count", 0)
+                    cur_mb = entry.get("size_mb", 0)
+                    item["current"] = {"file_count": cur_fc, "size_mb": cur_mb}
+                    if cur_fc == 0:
+                        item["status"] = "gone"
+                    elif not rec.get("file_count"):
+                        # 删除时无校对值（记 0）：不比对，避免假 diff
+                        item["status"] = "ok"
+                    elif cur_fc == rec.get("file_count") and round(cur_mb, 1) == round(
+                            rec.get("size_mb", -1), 1):
+                        item["status"] = "ok"
+                    else:
+                        item["status"] = "diff"
+                else:
+                    try:
+                        with os.scandir(dst) as _it:
+                            _non_empty = any(_it)
+                        item["status"] = "ok" if _non_empty else "gone"
+                    except Exception:
+                        item["status"] = "gone"
+                result.append(item)
+                continue
             cur_mb = get_dir_size_fast(dst)
             item["current"] = {"file_count": cur_fc, "size_mb": cur_mb}
             if cur_fc == 0:
                 item["status"] = "gone"
+            elif not rec.get("file_count"):
+                # 删除时无校对值（当时 MFT 未加载/无索引，记 0）：不比对，
+                # 目标非空即可恢复（避免假 diff：0 vs 真实值永远不一致）
+                item["status"] = "ok"
             elif cur_fc == rec.get("file_count") and round(cur_mb, 1) == round(
                     rec.get("size_mb", -1), 1):
                 item["status"] = "ok"
@@ -510,14 +783,39 @@ class Migrator:
                 return False, f"源路径已存在（{src}），拒绝覆盖"
         if not os.path.isdir(dst) or is_symlink(dst):
             return False, f"目标盘路径异常（{dst}）"
-        cur_fc = self._count_files_fast(dst)
-        cur_mb = get_dir_size_fast(dst)
-        if cur_fc == 0:
-            return False, "目标盘目录为空，无法恢复"
-        if not force and (cur_fc != rec.get("file_count")
-                          or round(cur_mb, 1) != round(rec.get("size_mb", -1), 1)):
-            return False, ("目标盘内容与删除时不一致（可能已被修改），"
-                           "如需强制恢复请在确认时勾选")
+        cur_mb = 0  # 校对大小：MFT 毫秒级或索引缓存，供 _add_migrated_record 复用
+        if self._mft_covers(dst):
+            cur_fc = self._count_files_fast(dst)
+            cur_mb = get_dir_size_fast(dst)
+            if cur_fc == 0:
+                return False, "目标盘目录为空，无法恢复"
+            # 删除时无校对值（记 0）则不比对，直接恢复（避免假 diff）
+            if not force and rec.get("file_count") and (
+                    cur_fc != rec.get("file_count")
+                    or round(cur_mb, 1) != round(rec.get("size_mb", -1), 1)):
+                return False, ("目标盘内容与删除时不一致（可能已被修改），"
+                               "如需强制恢复请在确认时勾选")
+        else:
+            # 跨盘目标：优先用轻量索引比对（后台构建，不卡），无索引快速非空检查
+            entry = self._get_dst_index(dst)
+            if entry and entry.get("file_count"):
+                cur_fc = entry.get("file_count", 0)
+                cur_mb = entry.get("size_mb", 0)
+                if cur_fc == 0:
+                    return False, "目标盘目录为空，无法恢复"
+                if not force and rec.get("file_count") and (
+                        cur_fc != rec.get("file_count")
+                        or round(cur_mb, 1) != round(rec.get("size_mb", -1), 1)):
+                    return False, ("目标盘内容与删除时不一致（可能已被修改），"
+                                   "如需强制恢复请在确认时勾选")
+            else:
+                try:
+                    with os.scandir(dst) as _it:
+                        _non_empty = any(_it)
+                    if not _non_empty:
+                        return False, "目标盘目录为空，无法恢复"
+                except Exception:
+                    return False, "目标盘目录为空，无法恢复"
         if not link_alive:
             parent = os.path.dirname(src)
             if parent and not os.path.isdir(parent):
@@ -529,7 +827,9 @@ class Migrator:
             if not ok:
                 return False, f"创建链接失败: {err}"
         # 恢复迁移记录 + 移除线索
-        self._add_migrated_record(src, dst)
+        # size 用已算好的校对值（MFT 毫秒级或索引缓存），
+        # 避免 _add_migrated_record 内部对跨盘目标再次全量遍历卡顿
+        self._add_migrated_record(src, dst, size_mb=cur_mb)
         self.cfg["deleted_links"] = [
             x for x in self.cfg.get("deleted_links", [])
             if x.get("src") != src]
@@ -554,8 +854,8 @@ class Migrator:
                     # 内部对 0 结果且目录存在时有 walk 兜底
                     mb = scanner.get_dir_size_mft(p)
                     return round(mb * 1024 * 1024)  # round 而非 int:避免截断丢 1 字节
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         return sum(f.lstat().st_size for f in Path(path).rglob('*')
                    if f.is_file() and not f.is_symlink())
 
@@ -575,8 +875,8 @@ class Migrator:
                     n = scanner.count_files(p)
                     if n >= 0:
                         return n
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         return sum(1 for _ in Path(path).rglob('*') if _.is_file())
 
     def _safe_rd(self, path):
@@ -720,8 +1020,8 @@ class Migrator:
             _threads = _resolve_copy_threads(self.cfg)
             if _threads > 0:
                 os.environ["RAYON_NUM_THREADS"] = str(_threads)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as e:
+            log.debug("忽略异常: %s", e)
         from migrate_engine import MigrateEngineError
 
         file_count = 0
@@ -888,8 +1188,8 @@ class Migrator:
                 capture_output=True, check=True, creationflags=_NO_WINDOW_FLAGS)
             if is_symlink(str(src)):
                 return True, ""
-        except subprocess.CalledProcessError:
-            pass
+        except subprocess.CalledProcessError as e:
+            log.debug("忽略异常: %s", e)
         # 2) Junction(/J)：无需管理员权限,非管理员场景兜底
         r = subprocess.run(["cmd", "/c", "mklink", "/J", str(src), str(dst)],
                            capture_output=True, creationflags=_NO_WINDOW_FLAGS)
@@ -903,8 +1203,8 @@ class Migrator:
                 capture_output=True, text=True, creationflags=_NO_WINDOW_FLAGS)
             if ps_ret.returncode == 0 and is_symlink(str(src)):
                 return True, ""
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         return False, "mklink /D、/J 和 PowerShell 均失败（请检查路径/权限后重试）"
 
     def _check_file_in_use(self, path):
@@ -1093,13 +1393,13 @@ class Migrator:
         if engine is not None:
             try:
                 engine.request_cancel()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             try:
                 if not engine.wait_exit(3.0):
                     engine.force_kill()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
 
     def _format_copy_fail(self, rc, src_path, action_label="迁移"):
@@ -1200,8 +1500,8 @@ class Migrator:
                         for _ in Path(ep).rglob('*'):
                             if _.is_file():
                                 file_count += 1
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
             return True, (f"目标目录已存在且非空：{dst_path}\n"
                          f"  包含 {len(entries)} 个条目，约 {file_count} 个文件\n"
                          f"  ⚠️ 镜像同步会删除目标中源没有的文件！\n\n"
@@ -1256,29 +1556,12 @@ class Migrator:
 
         # ===== 步骤0.1：src/dst 路径校验（防止镜像同步数据安全事故）=====
         # 修复 N2：原代码 src==dst 时跳过包含校验，复制引擎虽会报错但用户看到模糊错误
-        # 现改为显式拒绝，给出清晰提示
-        _norm_src = os.path.normcase(os.path.normpath(str(src)))
-        _norm_dst = os.path.normcase(os.path.normpath(str(dst)))
-        if _norm_src == _norm_dst:
-            log_error_with_reason("迁移路径相同",
-                f"src={src_path}, dst={dst_path}",
-                "源路径和目标路径相同，拒绝迁移")
-            return False, (f"源路径和目标路径相同，无法迁移：\n"
-                          f"  {src_path}\n"
-                          f"请选择不同的目标路径。")
-        try:
-            _common = os.path.commonpath([_norm_src, _norm_dst])
-            if _common == _norm_src or _common == _norm_dst:
-                log_error_with_reason("迁移路径包含关系",
-                    f"src={src_path}, dst={dst_path}",
-                    "路径包含校验失败，拒绝迁移")
-                return False, (f"源路径和目标路径存在包含关系，可能导致数据全毁：\n"
-                              f"  源: {src_path}\n"
-                              f"  目标: {dst_path}\n"
-                              f"镜像同步会复制到自身内部，清空源时连带目标一起删除。\n"
-                              f"请选择不同的目标路径。")
-        except ValueError:
-            pass  # 不同盘符，commonpath 抛 ValueError，不算包含
+        # 现改为显式拒绝，给出清晰提示（判定逻辑提取为 _validate_migration_paths）
+        _ok, _err = _validate_migration_paths(src_path, dst_path)
+        if not _ok:
+            log_error_with_reason("迁移路径校验失败",
+                f"src={src_path}, dst={dst_path}", "路径校验拒绝迁移")
+            return False, _err
 
         if kill_process:
             subprocess.run(["taskkill", "/F", "/IM", kill_process],
@@ -1344,6 +1627,19 @@ class Migrator:
             # 预检查失败必须提示用户，不能静默吞掉（否则可能迁移到一半空间不足卡住）
             log.warning(f"磁盘空间检查失败（可能影响迁移）: {e}")
             self._emit_log("warn", f"⚠️ 磁盘空间检查异常: {e}，可能导致迁移中途失败")
+
+        # ===== 云同步占位符检测：迁移前提示，不中断 =====
+        # 占位文件复制会触发强制下载（hydration），弱网/离线时拖慢甚至失败。
+        # 放在所有校验之后、写事务之前——校验失败时不做无谓扫描。
+        try:
+            _ph_count, _ph_example = count_cloud_placeholder_files(str(src))
+            if _ph_count > 0:
+                log.warning(f"迁移源含 {_ph_count} 个云同步占位文件: {_ph_example}")
+                self._emit_log("warn",
+                    f"  ⚠️ 源目录含 {_ph_count} 个云同步占位文件（OneDrive 等），"
+                    f"迁移会触发下载：{_ph_example}")
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
         # ===== 步骤1：写入 pending 事务记录（断电恢复依据）=====
         pending = self.cfg.setdefault("pending_migrations", [])
@@ -1520,7 +1816,7 @@ class Migrator:
         save_all(self.cfg)
         self._emit_log("migrate", f"  ✓ C 盘源目录已删除: {src.name}")
 
-        # ===== 步骤5：创建链接（Junction 优先，符号链接兜底）=====
+        # ===== 步骤5：创建链接（符号链接 /D 优先，Junction 兜底）=====
         self._emit_log("migrate", f"  🔗 正在创建链接: {src.name} → {dst}")
         mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst))
         if not mklink_ok:
@@ -1577,7 +1873,7 @@ class Migrator:
                             os.rmdir(old_src)
                         else:
                             os.unlink(old_src)
-                        # 重建为直接指向新 dst 的链接（Junction 优先）
+                        # 重建为直接指向新 dst 的链接（符号链接 /D 优先）
                         ok, _ = self._create_dir_link(old_src, str(dst))
                         if not ok:
                             raise Exception("创建链接失败")
@@ -1893,7 +2189,7 @@ class Migrator:
                           f"已记录未完成事务，下次启动程序会自动重试。\n"
                           f"或请手动删除该符号链接后重启程序。")
 
-        # ===== 步骤5：创建新链接 src_path → dst_path（Junction 优先）=====
+        # ===== 步骤5：创建新链接 src_path → dst_path（符号链接 /D 优先）=====
         self._emit_log("migrate", f"  🔗 正在创建新链接: {src.name} → {dst}")
         mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst))
         if not mklink_ok:
@@ -1906,8 +2202,8 @@ class Migrator:
                 # 恢复旧链接指向 real(与主建链一致:/D 优先,/J 兜底)
                 self._create_dir_link(str(src), str(real))
                 self._emit_log("warn", f"  ⚠️ 已恢复旧链接（指向旧数据 {real}）")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             for p in pending:
                 if p.get("src") == src_path:
                     p["stage"] = "mklink_failed"
@@ -2496,7 +2792,7 @@ class Migrator:
                                     self._incr_pending_fail(p, err_msg)
                                     results.append((src, "integrity_still_failed", err_msg))
                                 else:
-                                    # 完整性 OK，更新链接指向 dst（Junction 优先）
+                                    # 完整性 OK，更新链接指向 dst（符号链接 /D 优先）
                                     try:
                                         os.rmdir(src)
                                     except OSError:
@@ -2519,7 +2815,7 @@ class Migrator:
                                     results.append((src, "completed",
                                         f"从真实目标续传完成 ({dst_fc2} 文件)，已更新符号链接"))
                     elif not os.path.exists(src):
-                        # C 盘不存在，直接创建链接（Junction 优先）
+                        # C 盘不存在，直接创建链接（符号链接 /D 优先）
                         ok, lerr = self._create_dir_link(src, dst)
                         if ok:
                             self._add_migrated_record(src, dst)
@@ -2562,10 +2858,10 @@ class Migrator:
                                     self._safe_rd(src)
                                     if os.path.exists(src):
                                         shutil.rmtree(src, ignore_errors=True)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("忽略异常: %s", e)
                                 if not os.path.exists(src):
-                                    # 删除成功，创建链接（Junction 优先）
+                                    # 删除成功，创建链接（符号链接 /D 优先）
                                     ok, lerr = self._create_dir_link(src, dst)
                                     if ok:
                                         self._add_migrated_record(src, dst)
@@ -2650,10 +2946,10 @@ class Migrator:
                             self._safe_rd(src)
                             if os.path.exists(src):
                                 shutil.rmtree(src, ignore_errors=True)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                         if not os.path.exists(src):
-                            # 删除成功，创建链接（Junction 优先）
+                            # 删除成功，创建链接（符号链接 /D 优先）
                             ok, lerr = self._create_dir_link(src, dst)
                             if ok:
                                 self._add_migrated_record(src, dst)
@@ -2669,7 +2965,7 @@ class Migrator:
                             results.append((src, "delete_failed",
                                 err_msg + "，请关闭相关程序后重启程序"))
                     else:
-                        # C 盘不存在，直接创建链接（Junction 优先）
+                        # C 盘不存在，直接创建链接（符号链接 /D 优先）
                         ok, lerr = self._create_dir_link(src, dst)
                         if ok:
                             self._add_migrated_record(src, dst)
@@ -2816,22 +3112,22 @@ class Migrator:
                     self._safe_rd(src)
                     if os.path.exists(src):
                         shutil.rmtree(src, ignore_errors=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if os.path.exists(src):
                     err = f"改迁恢复: 删除 src 真实目录失败（可能被占用）: {src}"
                     self._incr_pending_fail(p, err)
                     return "delete_src_failed", err
 
-            # 创建新链接 src → dst（Junction 优先）
+            # 创建新链接 src → dst（符号链接 /D 优先）
             mklink_ok, _ = self._create_dir_link(src, dst)
 
             if not mklink_ok:
                 # 尝试恢复旧链接指向 real_target（让用户能访问数据）
                 try:
                     self._create_dir_link(src, real_target)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 p["stage"] = "mklink_failed"
                 p["error"] = "恢复时创建链接失败"
                 save_all(self.cfg)
@@ -2866,8 +3162,8 @@ class Migrator:
                     self._safe_rd(src)
                     if os.path.exists(src):
                         shutil.rmtree(src, ignore_errors=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if os.path.exists(src):
                     # 删除失败：不能继续 mklink（路径已存在会失败）
                     err = f"改迁恢复: 删除 src 真实目录失败（被占用）: {src}"
@@ -3747,7 +4043,7 @@ class Migrator:
         return results
 
     def scan_appdata(self, progress_cb=None):
-        """扫描C盘6个关键目录的所有一级子目录（不按阈值过滤，不跳过symlink）
+        """扫描监控目录（6 个关键目录 + 当前用户目录）的所有一级子目录（不按阈值过滤，不跳过symlink）
         progress_cb(current, total, dir_name) 用于更新进度条
 
         实现说明：
@@ -3755,6 +4051,7 @@ class Migrator:
             MFT 模式下大小计算为 O(1) 查预计算缓存，任意深度目录都准确
           - MFT 未加载或路径不在当前卷时自动回退到 os.walk
           - 不管底层套多少层子目录，一级子目录的大小都包含所有后代文件
+          - 用户目录下动态排除已监控子目录（AppData 等）与系统特殊文件夹（scan_dirs 模块）
         """
         # 获取全局 MFT 扫描器单例（可能为 None 或未加载）
         from utils import get_mft_scanner
@@ -3763,14 +4060,11 @@ class Migrator:
                    and mft_scanner.is_mft_mode)
 
         results = []
-        scan_dirs = [
-            (os.environ.get("LOCALAPPDATA", ""), "Local"),
-            (os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"), "Programs"),
-            (os.environ.get("APPDATA", ""), "Roaming"),
-            (r"C:\Program Files", "Program Files"),
-            (r"C:\Program Files (x86)", "Program Files (x86)"),
-            (r"C:\ProgramData", "ProgramData"),
-        ]
+        scan_dirs = get_scan_dirs()
+        # 用户目录一级子目录的动态排除集合：已监控 base（AppData\Local/Roaming 等）
+        # + 系统特殊文件夹（Known Folder API 解析，不硬编码目录名）
+        _user_dir_monitored = get_monitored_base_norms(scan_dirs)
+        _user_dir_known = get_known_folder_paths()
         candidates = []
         for base_path, label in scan_dirs:
             if not base_path or not os.path.exists(base_path):
@@ -3780,6 +4074,11 @@ class Migrator:
                     full_path = os.path.join(base_path, entry)
                     # 只扫一级子目录，不扫孙目录
                     if not os.path.isdir(full_path):
+                        continue
+                    # 用户目录下：动态排除已在监控列表的子目录（如 AppData\Local）
+                    # 与系统特殊文件夹（桌面/文档/下载等），避免重复与误迁移
+                    if label == USER_LABEL and is_user_dir_excluded(
+                            norm_path(full_path), _user_dir_monitored, _user_dir_known):
                         continue
                     # 跳过已建立软链接的文件夹（已迁移过）
                     if is_symlink(full_path):
@@ -3814,22 +4113,7 @@ class Migrator:
         desc_cache = self.cfg.get("desc_cache", {}) if hasattr(self, 'cfg') else {}
         desc_hit_count = 0
         # 开发环境已配置的 C 盘源路径集合（用于待迁移区橙色提示）
-        # dev_env_configured 结构: {tool_id: {source_path, target_drive, target_path, name, ...}}
-        # 同一个 C 盘源路径可能被多个工具配置（如 npm_global 和 npm_cache 都在 %APPDATA%\npm 下），
-        # 这里以源路径为 key 建索引，匹配到任一即标橙
-        dev_env_paths = {}  # {normalized_source_path: {name, target_drive, target_path}}
-        if hasattr(self, 'cfg'):
-            for tid, info in (self.cfg.get("dev_env_configured") or {}).items():
-                sp = (info or {}).get("source_path", "")
-                if not sp:
-                    continue
-                # 规范化：去 \\?\ 前缀，小写，去末尾反斜杠
-                sp_norm = sp.replace("\\\\?\\", "").lower().rstrip("\\")
-                dev_env_paths[sp_norm] = {
-                    "name": info.get("name", ""),
-                    "target_drive": info.get("target_drive", ""),
-                    "target_path": info.get("target_path", ""),
-                }
+        dev_env_paths = build_dev_env_paths(getattr(self, 'cfg', None))
         for i, (full_path, entry, label) in enumerate(candidates):
             try:
                 # 优先用 MFT 计算大小（O(1)，任意深度都准确）
@@ -3957,6 +4241,8 @@ class Migrator:
             r"C:\Program Files",
             r"C:\Program Files (x86)",
             r"C:\ProgramData",
+            # 当前用户目录：已迁移目录在 C 盘是符号链接，也需补进已迁移表
+            os.environ.get("USERPROFILE", ""),
         ]
         for base_path in _scan_dirs:
             if not base_path or not os.path.exists(base_path):
@@ -3967,6 +4253,12 @@ class Migrator:
                     if not os.path.isdir(full_path):
                         continue
                     if not is_symlink(full_path):
+                        continue
+                    # 只补录符号链接（本工具迁移产物，_create_dir_link /D 优先）
+                    # 过滤 junction：手动建的目录联接等和
+                    # 系统 XP 兼容链接都不是本工具迁移产物，补录会干扰用户选择
+                    # （用户可能误点"还原"把目标盘数据复制回 C 盘）
+                    if is_junction(full_path):
                         continue
                     # 过滤系统自带junction（XP兼容链接，非用户迁移）
                     if entry.lower() in SYSTEM_JUNCTION_NAMES:
@@ -4013,7 +4305,7 @@ class Migrator:
         src = Path(src_path)
         dst = Path(dst_path)
         if not src.exists():
-            # C盘路径不存在，直接创建链接（Junction 优先）
+            # C盘路径不存在，直接创建链接（符号链接 /D 优先）
             ok, lerr = self._create_dir_link(str(src), str(dst))
             if ok:
                 log_link_operation("修复链接(缺失)", str(src), str(dst), "C盘路径不存在，直接创建链接")
@@ -4061,7 +4353,7 @@ class Migrator:
         except Exception as e:
             log_error_with_reason("删除C盘目录失败", str(e), f"修复链接: {src_path}")
             return False, f"删除C盘目录失败: {e}"
-        # 3. 创建链接（Junction 优先）
+        # 3. 创建链接（符号链接 /D 优先）
         ok, lerr = self._create_dir_link(str(src), str(dst))
         if not ok:
             # 创建失败，尝试把数据复制回来(回滚:目标盘→C盘)
@@ -4214,7 +4506,7 @@ class Migrator:
                     self._emit_log("error", f"  ❌ 创建父目录失败: {os.path.basename(src)} - {e}")
                     continue
 
-            # 创建链接（Junction 优先）
+            # 创建链接（符号链接 /D 优先）
             ok, lerr = self._create_dir_link(src, dst)
             if ok:
                 rebuilt += 1

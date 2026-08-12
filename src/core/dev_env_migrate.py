@@ -1092,15 +1092,15 @@ def _find_conda_install_paths():
                                         dir_path = os.path.dirname(cleaned)
                                         if dir_path:
                                             _try_add(dir_path)
-                                except OSError:
-                                    pass
+                                except OSError as e:
+                                    _log.debug("忽略异常: %s", e)
                             winreg.CloseKey(child)
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            _log.debug("忽略异常: %s", e)
                 finally:
                     winreg.CloseKey(key)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("忽略异常: %s", e)
 
     # 2. 用户目录 / ProgramData / LOCALAPPDATA 下的默认安装路径
     _try_add(os.path.join(os.environ.get("USERPROFILE", ""), "anaconda3"))
@@ -1556,8 +1556,8 @@ def maven_repo_path():
             m = re.search(r'<localRepository>([^<]+)</localRepository>', content)
             if m:
                 return m.group(1).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("忽略异常: %s", e)
     return _home(".m2", "repository")
 
 
@@ -1617,8 +1617,8 @@ def docker_data_path():
             install_loc, _ = winreg.QueryValueEx(key, "InstallLocation")
             if install_loc and os.path.exists(install_loc):
                 return install_loc
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("忽略异常: %s", e)
     return ""
 
 
@@ -1674,8 +1674,8 @@ def r_libs_path():
             versions = sorted(os.listdir(base))
             if versions:
                 return os.path.join(base, versions[-1])
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("忽略异常: %s", e)
         return base
     # 未安装时返回默认路径（不检查目录是否存在）
     return base
@@ -1806,8 +1806,8 @@ def bazel_output_path():
                         parts = line.split("output_user_root=")
                         if len(parts) > 1:
                             return parts[1].strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("忽略异常: %s", e)
     # 默认 %LOCALAPPDATA%\bazel\_bazel_<用户名>
     username = os.environ.get("USERNAME", "user")
     return os.path.join(os.environ.get("LOCALAPPDATA", ""), "bazel",
@@ -1986,8 +1986,8 @@ def is_already_configured(tool, target_drive):
             target = get_symlink_target(current)
             if target:
                 current = target
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("忽略异常: %s", e)
     target = target_drive.lower()
     cur = current.replace("/", "\\").lower()
     return cur.startswith(target + ":") or cur.startswith(target + "\\")
@@ -2202,8 +2202,8 @@ def apply_tool(tool, target_drive, target_path_override=None):
     for d in target_dirs:
         try:
             os.makedirs(d, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("忽略异常: %s", e)
 
     # 5. 记录实际使用的目标路径到 dev_env_configured（供 unapply 和状态显示用）
     try:
@@ -2211,8 +2211,8 @@ def apply_tool(tool, target_drive, target_path_override=None):
         # 这里只返回消息，实际记录由调用方处理
         if override:
             msgs.append(f"ℹ️ 实际目标路径: {override}")
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("忽略异常: %s", e)
 
     return True, "\n".join(msgs) if msgs else "配置完成"
 
@@ -2465,8 +2465,8 @@ def get_tool_status(tool, target_drive, migrated_records=None):
                 symlink_target = get_symlink_target(current_path)
                 if symlink_target:
                     current_path = symlink_target.replace("/", "\\")
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("忽略异常: %s", e)
     return {
         "installed": installed,
         "current_path": current_path,
@@ -2781,8 +2781,8 @@ def migrate_tool_data(tool, target_drive, config=None, source_path_override=None
                 # 然后把符号链接重新指向新目标
                 # 但这里更简单的做法：直接把 real_target 作为源路径
                 source_path = real_target.replace("\\\\?\\", "")
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("忽略异常: %s", e)
 
     # 检查源路径是否存在
     if not os.path.exists(source_path):

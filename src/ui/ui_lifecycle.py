@@ -213,8 +213,8 @@ class LifecycleHandler:
             if _batch_custom and _batch_custom.isRunning():
                 try:
                     self.migrator.force_cancel_copy()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 _batch_custom.quit()
                 _batch_custom.wait(1000)
             # 停止 app.log tail 定时器
@@ -235,16 +235,16 @@ class LifecycleHandler:
                 scanner = get_mft_scanner()
                 if scanner is not None:
                     scanner.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             if self.tray_icon:
                 self.tray_icon.hide()
             # 记录退出时间到监控日志（方便排查中断问题）
             try:
                 from config import log_link_operation
                 log_link_operation("程序退出", "C盘拦迁器关闭")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             event.accept()
             # 兜底强制退出已在 closeEvent 开头用 threading.Timer 启动（独立线程，不受 wait 阻塞）
             # 这里无需再用 QTimer.singleShot（主线程可能被 wait 阻塞导致 QTimer 不触发）
@@ -266,6 +266,14 @@ class LifecycleHandler:
         self.cfg["auto_clean_vss"] = checked
         save_all(self.cfg)
         self.status_label.setText(f"迁移后清理还原点: {'开启' if checked else '关闭'}")
+
+    def toggle_user_dir_notify(self, checked):
+        """用户目录写入提醒（右下角气泡）开关"""
+        self.cfg["user_dir_notify_enabled"] = bool(checked)
+        save_all(self.cfg)
+        if getattr(self, "monitor_worker", None):
+            self.monitor_worker.user_dir_notify_enabled = bool(checked)
+        self.status_label.setText(f"用户目录写入提醒: {'开启' if checked else '关闭'}")
 
     def _get_autostart_path(self):
         """注册表开机启动路径"""
@@ -310,8 +318,8 @@ class LifecycleHandler:
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
-                except FileNotFoundError:
-                    pass
+                except FileNotFoundError as e:
+                    log.debug("忽略异常: %s", e)
                 self.status_label.setText("开机启动: 已关闭")
             winreg.CloseKey(key)
         except Exception as e:
@@ -344,8 +352,8 @@ class LifecycleHandler:
             self.resource_label.setText(
                 f"内存:{proc_mem_mb:.0f}MB 线程:{num_threads} | "
                 f"系统CPU:{sys_cpu:.0f}% 内存:{sys_mem_used_gb:.1f}/{sys_mem_total_gb:.1f}GB({sys_mem_pct:.0f}%)")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         # 网速计算（下载/上传速率）
         try:
             now = time.time()
@@ -360,8 +368,8 @@ class LifecycleHandler:
                     f"↓{self._fmt_speed(down_speed)} ↑{self._fmt_speed(up_speed)}")
             self._net_last = cur
             self._net_last_time = now
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     @staticmethod
     def _fmt_speed(speed_bps):
@@ -436,17 +444,17 @@ class LifecycleHandler:
                             tgt_item.setText("（非符号链接）")
                             tgt_item.setForeground(QColor("#9E9E9E"))
                             tgt_item.setToolTip("C盘路径不是符号链接，可能是真实目录（被软件覆盖）")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             if changed > 0:
                 self._update_stats(migrated_count=self.table_migrated.rowCount())
                 # 在监控日志记录状态变化
                 try:
                     self.on_monitor_log("fix", f"自动检测到{changed}个链接状态变化（已自动更新显示）")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
 
     def _update_stats(self, migrated_count=None, scan_count=None):
         """更新两个标签页的统计标签"""
@@ -474,8 +482,8 @@ class LifecycleHandler:
                         if val is None:
                             val = size_item.text()
                         total_mb += float(val)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             self.stat_scan.setText(f"共{scan_count}项 | {total_mb:.0f}MB")
 
     def _clear_cache(self):
@@ -522,8 +530,8 @@ class LifecycleHandler:
                                 if hasattr(self, '_old_dev_env_workers') and _w in self._old_dev_env_workers:
                                     self._old_dev_env_workers.remove(_w)
                                 _w.deleteLater()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                         _t.finished.connect(_cleanup_desc)
                         if hasattr(self, '_old_dev_env_workers'):
                             self._old_dev_env_workers.append(_t)
@@ -558,8 +566,8 @@ class LifecycleHandler:
                                 if hasattr(self, '_old_dev_env_workers') and _w in self._old_dev_env_workers:
                                     self._old_dev_env_workers.remove(_w)
                                 _w.deleteLater()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("忽略异常: %s", e)
                         _t.finished.connect(_cleanup_ai)
                         if hasattr(self, '_old_dev_env_workers'):
                             self._old_dev_env_workers.append(_t)
@@ -621,8 +629,8 @@ class LifecycleHandler:
             logger.error(f"[清空缓存] 闪退异常: {e}\n{tb}")
             try:
                 log_error_with_reason("清空缓存闪退", f"{e}\n{tb}", "MainWindow._clear_cache")
-            except Exception:
-                pass
+            except Exception as e2:
+                log.debug("忽略异常: %s", e2)
             self.status_label.setText(f"清空缓存失败: {e}")
             # 重新抛出，让程序顶层崩溃处理器（如有）也能感知
             raise
@@ -647,8 +655,8 @@ class LifecycleHandler:
                         import pythoncom
                         try:
                             pythoncom.CoInitialize()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                         self.progress.emit("正在后台加载 MFT 索引...")
                         from fast_scan import MftScanner
                         t0 = time.time()
@@ -692,8 +700,8 @@ class LifecycleHandler:
             for _h in log.handlers:
                 try:
                     _h.flush()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         reply = QMessageBox.question(
             self, "重启程序",

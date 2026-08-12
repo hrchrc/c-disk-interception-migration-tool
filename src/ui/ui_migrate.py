@@ -148,8 +148,8 @@ class MigrateHandler:
                     def _progress(event_type, message):
                         try:
                             self.log_signal.emit(event_type, message)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     self.migrator.log_callback = _progress
                     results = []
                     if self.rtype in ("migration", "both"):
@@ -161,13 +161,13 @@ class MigrateHandler:
                     log.error(f"异步恢复异常: {e}")
                     try:
                         self.done_signal.emit([("", "error", f"恢复异常: {e}")])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 finally:
                     try:
                         self.migrator.log_callback = None
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
 
         worker = _RecoverWorker(self.migrator, recover_type)
         self._recover_worker = worker  # 保存引用避免 GC
@@ -176,8 +176,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         def _on_done(results):
             try:
@@ -193,8 +193,8 @@ class MigrateHandler:
                 # 确保 worker 完全退出，避免竞态
                 try:
                     worker.wait(500)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
         worker.log_signal.connect(_on_log, Qt.QueuedConnection)
         worker.done_signal.connect(_on_done, Qt.QueuedConnection)
@@ -650,8 +650,8 @@ class MigrateHandler:
                 def _migrate_progress(event_type, message):
                     try:
                         self.log_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _migrate_progress
                 try:
                     ok, msg = self.migrator.migrate(self.path)
@@ -667,8 +667,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._migrate_worker.log_signal.connect(_on_migrate_log)
 
         def _on_migrate_done(ok, msg, path, done_row):
@@ -697,8 +697,8 @@ class MigrateHandler:
                             def _progress(event_type, message):
                                 try:
                                     self.log_signal.emit(event_type, message)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("忽略异常: %s", e)
                             self.migrator.log_callback = _progress
                             try:
                                 ok2, msg2 = self.migrator.migrate(self.path, force_overwrite=True)
@@ -745,8 +745,8 @@ class MigrateHandler:
             # 无论成功失败都刷新待处理事务按钮（失败可能已写入 pending）
             try:
                 self._update_pending_decisions_button()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._migrate_worker.done_signal.connect(_on_migrate_done)
         self._migrate_worker.start()
 
@@ -796,8 +796,8 @@ class MigrateHandler:
                     # 检查是否已配置，避免重复配置
                     if not dev_is_configured(tool, target_drive):
                         matched_tools.append(tool)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         if not matched_tools:
             return
@@ -854,8 +854,8 @@ class MigrateHandler:
             # 刷新开发环境迁移表，显示最新状态
             try:
                 self._refresh_dev_env_table()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _auto_unconfig_dev_env_after_restore(self, src_path):
         """数据还原回 C 盘后，自动撤销对应开发工具的环境变量配置
@@ -893,8 +893,8 @@ class MigrateHandler:
                     # 检查是否已配置到该盘（用 dev_env_configured 判断）
                     if dev_is_configured(tool, target_drive):
                         matched_tools.append((tool, target_drive))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         if not matched_tools:
             return
@@ -909,8 +909,8 @@ class MigrateHandler:
                     # 删除 dev_env_configured 中的残留条目，避免状态不一致
                     try:
                         dev_env_cfg.pop(tool["id"], None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                     self._log_monitor("dev_env",
                         f"自动撤销 {tool['name']} 环境变量配置（数据还原后自动触发）")
                 else:
@@ -930,8 +930,8 @@ class MigrateHandler:
             # 刷新开发环境迁移表，显示最新状态
             try:
                 self._refresh_dev_env_table()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _update_dev_env_target_path(self, src_path, new_target_path):
         """通用：将 dev_env_configured 中匹配 src_path 的工具 target_path 更新为新路径
@@ -956,15 +956,15 @@ class MigrateHandler:
                         cfg_info["target_path"] = new_target_path
                         updated.append(tool["name"])
                         log.info(f"更新开发环境配置 target_path: {tool['name']} → {new_target_path}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         if updated:
             self.cfg["dev_env_configured"] = dev_env_cfg
             save_all(self.cfg)
             try:
                 self._refresh_dev_env_table()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _unconfig_dev_env_for_path(self, src_path):
         """通用：撤销 src_path 对应的开发工具环境变量配置
@@ -995,17 +995,17 @@ class MigrateHandler:
                         dev_env_cfg.pop(tool_id, None)
                         unconfigured.append(tool["name"])
                         log.info(f"自动撤销开发环境配置: {tool['name']}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         if unconfigured:
             try:
                 save_all(self.cfg)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             try:
                 self._refresh_dev_env_table()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
     def _rebuild_all_links_wizard(self):
         """重装系统后一键重建所有符号链接的向导
@@ -1127,13 +1127,13 @@ class MigrateHandler:
                     def _progress(current, total, msg):
                         try:
                             self.progress_signal.emit(current, total, msg)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     def _log(et, msg):
                         try:
                             self.log_signal.emit(et, msg)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     self.migrator.log_callback = _log
                     rebuilt, skipped, failed, details = self.migrator.rebuild_all_links(
                         username_map=self.username_map, progress_cb=_progress)
@@ -1156,8 +1156,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         def _on_rebuild_done(rebuilt, skipped, failed, details):
             self.progress.setVisible(False)
@@ -1210,11 +1210,11 @@ class MigrateHandler:
                 for f in filenames:
                     try:
                         total += os.path.getsize(os.path.join(dirpath, f))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
             size = round(total / 1024 / 1024, 1)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
         try:
             desc = get_dir_description(src_path) or ""
         except Exception:
@@ -1224,6 +1224,7 @@ class MigrateHandler:
         location = ""
         la = os.environ.get("LOCALAPPDATA", "").lower()
         ap = os.environ.get("APPDATA", "").lower()
+        up = os.environ.get("USERPROFILE", "").lower()
         pl = la + "\\programs"
         sp = src_path.lower()
         if sp.startswith(la + "\\") and not sp.startswith(pl):
@@ -1232,6 +1233,9 @@ class MigrateHandler:
             location = "Programs"
         elif sp.startswith(ap + "\\"):
             location = "Roaming"
+        elif up and sp.startswith(up + "\\"):
+            # 用户目录一级子目录（注意：Local/Programs/Roaming 是它的子目录，须先判）
+            location = "User"
         elif sp.startswith("c:\\program files (x86)"):
             location = "Program Files (x86)"
         elif sp.startswith("c:\\program files"):
@@ -1440,8 +1444,8 @@ class MigrateHandler:
                 def _relocate_progress(event_type, message):
                     try:
                         self.log_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _relocate_progress
                 try:
                     ok, msg = self.migrator.migrate_symlink(
@@ -1458,8 +1462,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._relocate_worker.log_signal.connect(_on_relocate_log)
 
         def _on_relocate_done(ok, msg, path):
@@ -1486,8 +1490,8 @@ class MigrateHandler:
                             def _progress(event_type, message):
                                 try:
                                     self.log_signal.emit(event_type, message)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("忽略异常: %s", e)
                             self.migrator.log_callback = _progress
                             try:
                                 ok2, msg2 = self.migrator.migrate_symlink(
@@ -1560,8 +1564,8 @@ class MigrateHandler:
             # 无论成功失败都刷新待处理事务按钮
             try:
                 self._update_pending_decisions_button()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._relocate_worker.done_signal.connect(_on_relocate_done)
         self._relocate_worker.start()
 
@@ -1612,8 +1616,8 @@ class MigrateHandler:
                 try:
                     p = self.table_migrated.item(row, 0).text()
                     paths_to_restore.append(p)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             self.status_label.setText(f"正在批量还原 {len(paths_to_restore)} 个目录（后台执行）...")
 
             class _BatchRestoreWorker(QThread):
@@ -1632,8 +1636,8 @@ class MigrateHandler:
                     def _batch_restore_progress(event_type, message):
                         try:
                             self.log_signal.emit(event_type, message)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
                     self.migrator.log_callback = _batch_restore_progress
                     try:
                         for i, p in enumerate(self.paths, 1):
@@ -1659,8 +1663,8 @@ class MigrateHandler:
                 try:
                     self.status_label.setText(message[:200])
                     self._log_monitor(event_type, message)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             self._batch_restore_worker.log_signal.connect(_on_batch_restore_log)
 
             def _on_batch_restore_done(success_paths, fail_msgs):
@@ -1697,8 +1701,8 @@ class MigrateHandler:
                 # 刷新待处理事务按钮
                 try:
                     self._update_pending_decisions_button()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
 
             self._batch_restore_worker.done_signal.connect(_on_batch_restore_done)
             self._batch_restore_worker.start()
@@ -1783,8 +1787,8 @@ class MigrateHandler:
                 try:
                     self.status_label.setText(message[:200])
                     self._log_monitor(event_type, message)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             self._batch_relink_worker.progress_signal.connect(_on_relink_progress)
 
             def _on_relink_done(results):
@@ -1867,6 +1871,12 @@ class MigrateHandler:
             self.cfg["migrated"] = [m for m in self.cfg["migrated"]
                 if m["src"] not in srcs_to_del]
             save_all(self.cfg)
+            # 迁移记录移除 → 删除对应目标目录轻量索引（记录移除即删索引）
+            for src_path, dst_path in rows_info:
+                try:
+                    self.migrator.remove_dst_index(dst_path)
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
             # 局部刷新：只删除表格中对应的行，不重新扫描文件系统（避免 MFT 索引重建）
             for row in sorted(rows, reverse=True):
                 self.table_migrated.removeRow(row)
@@ -1933,8 +1943,8 @@ class MigrateHandler:
                 def _fix_progress(event_type, message):
                     try:
                         self.progress_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _fix_progress
                 try:
                     for row, src_path, dst_path in self.items:
@@ -1963,8 +1973,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._batch_fix_link_worker.progress_signal.connect(_on_fix_progress)
 
         def _on_fix_done(results):
@@ -2131,8 +2141,8 @@ class MigrateHandler:
                 def _batch_progress(event_type, message):
                     try:
                         self.log_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _batch_progress
                 try:
                     for i, (_, src_path) in enumerate(self.items, 1):
@@ -2159,8 +2169,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._batch_migrate_worker.log_signal.connect(_on_batch_log)
 
         def _on_batch_done(success_paths, fail_details):
@@ -2203,8 +2213,8 @@ class MigrateHandler:
             # 刷新待处理事务按钮
             try:
                 self._update_pending_decisions_button()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._batch_migrate_worker.done_signal.connect(_on_batch_done)
         self._batch_migrate_worker.start()
 
@@ -2338,8 +2348,8 @@ class MigrateHandler:
                 def _custom_progress(event_type, message):
                     try:
                         self.log_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _custom_progress
                 try:
                     for i, (src_path, dst_path) in enumerate(self.items, 1):
@@ -2366,8 +2376,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._batch_migrate_custom_worker.log_signal.connect(_on_custom_log)
 
         def _on_custom_done(success_paths, fail_details):
@@ -2428,8 +2438,8 @@ class MigrateHandler:
                 def _restore_progress(event_type, message):
                     try:
                         self.progress_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _restore_progress
                 try:
                     ok, msg = self.migrator.restore(self.path)
@@ -2445,8 +2455,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._restore_worker.progress_signal.connect(_on_restore_progress)
 
         def _on_restore_done(ok, msg, path):
@@ -2481,8 +2491,8 @@ class MigrateHandler:
             # 无论成功失败都刷新待处理事务按钮
             try:
                 self._update_pending_decisions_button()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
 
         self._restore_worker.done_signal.connect(_on_restore_done)
         self._restore_worker.start()
@@ -2498,6 +2508,7 @@ class MigrateHandler:
             QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
             QMessageBox,
         )
+        # 删除记录恢复对话框：路径列 Interactive 可拖拽 + ElideNone 无省略号
         from i18n import tr as _tr
         try:
             records = self.migrator.list_deleted_links()
@@ -2513,7 +2524,8 @@ class MigrateHandler:
 
         dlg = QDialog(self)
         dlg.setWindowTitle(_tr("删除记录恢复"))
-        dlg.resize(800, 420)
+        # 两列 400px 对称 + 其余列，需 1060 宽才无横向滚动条
+        dlg.resize(1060, 420)
         layout = QVBoxLayout(dlg)
         tip = QLabel(_tr(
             "以下为删除记录时记录的恢复线索（目标盘数据保留）。"
@@ -2524,8 +2536,15 @@ class MigrateHandler:
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels([
             _tr("恢复"), _tr("C盘路径"), _tr("目标盘路径"), _tr("删除时间"), _tr("校对状态")])
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        # 路径列：两列完全对称（Interactive 可拖拽 + 400px 宽 + 无省略号）
+        # 无省略号用 NoElideDelegate 绘制层强制（view 级 setTextElideMode 实测不生效）
+        from ui_widgets import NoElideDelegate
+        table.setTextElideMode(Qt.ElideNone)
+        table.setItemDelegate(NoElideDelegate(table))
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        table.setColumnWidth(1, 400)
+        table.setColumnWidth(2, 400)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         status_map = {
@@ -2539,8 +2558,12 @@ class MigrateHandler:
             cb = QCheckBox()
             cb.setEnabled(rec["status"] != "gone")
             table.setCellWidget(row, 0, cb)
-            table.setItem(row, 1, QTableWidgetItem(rec.get("src", "")))
-            table.setItem(row, 2, QTableWidgetItem(rec.get("dst", "")))
+            _src_item = QTableWidgetItem(rec.get("src", ""))
+            _src_item.setToolTip(rec.get("src", ""))
+            table.setItem(row, 1, _src_item)
+            _dst_item = QTableWidgetItem(rec.get("dst", ""))
+            _dst_item.setToolTip(rec.get("dst", ""))
+            table.setItem(row, 2, _dst_item)
             table.setItem(row, 3, QTableWidgetItem(rec.get("time", "")))
             table.setItem(row, 4, QTableWidgetItem(status_map.get(rec["status"], "?")))
         layout.addWidget(table)
@@ -2548,6 +2571,9 @@ class MigrateHandler:
         btn_row = QHBoxLayout()
         btn_recover = QPushButton(_tr("恢复选中"))
         btn_close = QPushButton(_tr("关闭"))
+        # 固定最小宽度：窗口拉窄时按钮文字不挤在一起
+        btn_recover.setMinimumWidth(100)
+        btn_close.setMinimumWidth(80)
         btn_row.addWidget(btn_recover)
         btn_row.addStretch()
         btn_row.addWidget(btn_close)
@@ -2823,8 +2849,8 @@ class MigrateHandler:
                                     else:
                                         try:
                                             item.unlink()
-                                        except Exception:
-                                            pass
+                                        except Exception as e:
+                                            log.debug("忽略异常: %s", e)
                             # 删除空目录本身
                             try:
                                 dst_path.rmdir()
@@ -3037,8 +3063,8 @@ class MigrateHandler:
                 def _browse_progress(event_type, message):
                     try:
                         self.log_signal.emit(event_type, message)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("忽略异常: %s", e)
                 self.migrator.log_callback = _browse_progress
                 try:
                     ok, msg = self.migrator.migrate(self.path)
@@ -3053,8 +3079,8 @@ class MigrateHandler:
             try:
                 self.status_label.setText(message[:200])
                 self._log_monitor(event_type, message)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
         self._browse_migrate_worker.log_signal.connect(_on_browse_log)
         def _on_browse_done(ok, msg, src_path):
             # 程序退出中：跳过弹窗和 UI 更新
