@@ -305,6 +305,7 @@ def _get_registry_snapshot():
         if _REG_SNAPSHOT is not None:
             return _REG_SNAPSHOT
         snapshot = []
+        _build_failed = False
         try:
             import winreg
             roots = [
@@ -348,6 +349,10 @@ def _get_registry_snapshot():
                     winreg.CloseKey(key)
         except Exception as e:
             log.debug("忽略异常: %s", e)
+            _build_failed = True
+        if _build_failed:
+            # 构建失败不缓存，下次调用重试（避免永久缓存残缺数据）
+            return []
         _REG_SNAPSHOT = snapshot
         return snapshot
 
@@ -369,12 +374,16 @@ def _get_wmi_snapshot():
             return _WMI_SNAPSHOT
         snapshot = []
         _query_failed = False
+        _com_initialized = False
         try:
-            # WMI 调用需要 COM 初始化（异步补全工作线程各自 CoInitialize，
-            # 但快照可能在任意线程首次构建，这里统一保护）
+            # WMI 调用需要 COM 初始化。注意：CoInitialize 若返回 S_FALSE
+            # （线程已初始化）则不能 CoUninitialize，否则会破坏外层调用方
+            # 的 COM 状态（异步补全工作线程已各自初始化）。
             try:
                 import pythoncom
-                pythoncom.CoInitialize()
+                hr = pythoncom.CoInitialize()
+                # S_OK=0 表示本次新初始化；S_FALSE=1 表示已初始化
+                _com_initialized = (hr == 0)
             except Exception:
                 pass
             try:
@@ -406,11 +415,13 @@ def _get_wmi_snapshot():
                         snapshot = []
                         _query_failed = True
             finally:
-                try:
-                    import pythoncom
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
+                # 仅本次新初始化才 Uninitialize（避免破坏外层 COM 状态）
+                if _com_initialized:
+                    try:
+                        import pythoncom
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
         except Exception as e:
             log.debug("忽略异常: %s", e)
             _query_failed = True

@@ -121,7 +121,7 @@ class ScanHandler:
                 self._cancel = True
             def run(self):
                 import time as _time
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import queue as _queue
                 _t0 = _time.perf_counter()
                 _dbg.info("[异步补全] 线程 run() 进入")
                 self.log_signal.emit(f"[异步补全] 启动：待识别 {len(self.paths)} 个目录（8路并行+5秒超时）")
@@ -136,13 +136,12 @@ class ScanHandler:
                 _succ = 0
                 _total = len(self.paths)
                 _timeout_count = 0
-                _timeout_paths = []  # 超时目录路径列表（总结时展示）
                 try:
                     from software_detect import get_dir_description as _gdd
 
                     def _identify_one(path):
                         """单条识别（在工作线程中执行，含 COM 初始化）
-                        超时由 ThreadPoolExecutor 的 future.result(timeout=5) 控制
+                        超时由主循环 future.result(timeout=5) 控制
                         """
                         import pythoncom as _pcm
                         try:
@@ -161,10 +160,41 @@ class ScanHandler:
                             except Exception:
                                 pass
 
-                    # 8 路并行识别
-                    executor = ThreadPoolExecutor(max_workers=8)
+                    # 8 路并行识别（自管理 daemon 线程池：
+                    # ThreadPoolExecutor 线程非 daemon，卡死的 WMI 任务会导致
+                    # 程序退出挂起；daemon 线程不阻塞退出）
+                    import threading as _th
+                    _MAX_WORKERS = 8
+                    _work_q = _queue.Queue()
+                    _result_q = _queue.Queue()
+                    # 结果队列：存入 (path, desc)；超时任务由主循环标记
+                    for _p in self.paths:
+                        _work_q.put(_p)
+
+                    def _worker_loop():
+                        """daemon 工作线程：取任务 → 识别 → 结果入队"""
+                        while True:
+                            try:
+                                _p = _work_q.get_nowait()
+                            except _queue.Empty:
+                                return
+                            if self._cancel:
+                                return
+                            try:
+                                _src, _desc = _identify_one(_p)
+                                _result_q.put((_src, _desc))
+                            except Exception:
+                                _result_q.put((_p, ("error", "worker 异常")))
+
+                    _workers = []
+                    for _i in range(_MAX_WORKERS):
+                        _t = _th.Thread(target=_worker_loop, daemon=True)
+                        _t.start()
+                        _workers.append(_t)
+
                     _pending = []  # 批量积累结果，攒够 20 条或 200ms 才 emit 一次
                     _last_batch_emit = _time.perf_counter()
+                    _done_cnt = 0
 
                     def _flush_pending(force=False):
                         """积累到阈值或超时后批量发送（force=True 时无条件发送剩余）"""
@@ -179,40 +209,42 @@ class ScanHandler:
                             _last_batch_emit = now
                             self.filled_batch.emit(batch)
 
-                    try:
-                        futures = {executor.submit(_identify_one, p): p for p in self.paths}
-                        for future in as_completed(futures):
-                            if self._cancel:
+                    # 主循环：收结果（带 5s 超时），攒批 emit
+                    # 总超时保护：即使有 worker 永久卡死（WMI 无响应），
+                    # 180 秒后强制退出，避免死循环
+                    _loop_deadline = _time.perf_counter() + 180.0
+                    while _done_cnt < _total:
+                        if self._cancel:
+                            break
+                        if _time.perf_counter() > _loop_deadline:
+                            _dbg.warning(f"[异步补全] 总超时 180s 强制退出（完成 {_done_cnt}/{_total}）")
+                            # 未完成的任务计入超时统计（总结时展示数量，不列路径）
+                            _timeout_count = _total - _done_cnt
+                            break
+                        try:
+                            _src_path, _desc = _result_q.get(timeout=5.0)
+                        except _queue.Empty:
+                            # 5 秒无新结果：检查是否全部完成（避免漏掉最后一条）
+                            _alive = sum(1 for _w in _workers if _w.is_alive())
+                            if _alive == 0:
                                 break
-                            path = futures[future]
-                            try:
-                                # 单条超时 5 秒（替代原来的子线程 join 模式）
-                                src_path, desc = future.result(timeout=5.0)
-                            except Exception as e:
-                                # TimeoutError 或其他异常
-                                _timeout_count += 1
-                                _timeout_paths.append(path)
-                                _dbg.warning(f"[异步补全] 单条超时/异常 (>5s): {path}: {e}")
-                                count += 1
-                                continue
-                            count += 1
-                            if isinstance(desc, tuple) and desc[0] == "error":
-                                _dbg.error(f"[异步补全] 识别异常 {src_path}: {desc[1]}")
-                                self.error_signal.emit(src_path, str(desc[1]))
-                            else:
-                                # 成功/空结果统一积累，批量 emit（降低主线程信号压力）
-                                if not self._cancel:
-                                    _pending.append((src_path, desc or ""))
-                                    if desc:
-                                        _succ += 1
-                                    _flush_pending()
-                    finally:
-                        # 发送剩余积累结果
-                        _flush_pending(force=True)
-                        # 取消所有未开始的 future，不等待正在运行的线程
-                        for f in futures:
-                            f.cancel()
-                        executor.shutdown(wait=False)
+                            continue
+                        _done_cnt += 1
+                        count += 1
+                        if isinstance(_desc, tuple) and _desc[0] == "error":
+                            _dbg.error(f"[异步补全] 识别异常 {_src_path}: {_desc[1]}")
+                            self.error_signal.emit(_src_path, str(_desc[1]))
+                        else:
+                            if not self._cancel:
+                                _pending.append((_src_path, _desc or ""))
+                                if _desc:
+                                    _succ += 1
+                                _flush_pending()
+                    # 发送剩余积累结果
+                    _flush_pending(force=True)
+                    # 等待工作线程退出（daemon，不阻塞进程退出）
+                    for _w in _workers:
+                        _w.join(timeout=1.0)
                 except BaseException as e:
                     import traceback
                     _dbg.error(f"[异步补全] 线程级异常: {e}\n{traceback.format_exc()}")
@@ -222,14 +254,11 @@ class ScanHandler:
                     except Exception as e:
                         log.debug("忽略异常: %s", e)
                 _elapsed = _time.perf_counter() - _t0
-                # 总结：只发一条，包含超时目录路径
-                if _timeout_paths:
-                    timeout_list = "\n".join(f"    • {p}" for p in _timeout_paths[:10])
-                    if len(_timeout_paths) > 10:
-                        timeout_list += f"\n    ... 还有 {len(_timeout_paths) - 10} 个超时目录未显示"
+                # 总结：只发一条；总超时强制退出时提示未完成数量
+                if _timeout_count > 0:
                     _summary = (f"[异步补全] 完成：{_succ}/{_total} 成功 - "
                                 f"总耗时 {_elapsed:.2f}s - "
-                                f"超时 {_timeout_count} 个目录：\n{timeout_list}")
+                                f"⚠ {_timeout_count} 个目录未完成（识别超时）")
                 else:
                     _summary = (f"[异步补全] 完成：{_succ}/{_total} 成功 - "
                                 f"总耗时 {_elapsed:.2f}s ✓")
