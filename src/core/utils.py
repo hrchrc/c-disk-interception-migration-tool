@@ -162,7 +162,7 @@ def is_junction(path):
 
     与符号链接（IO_REPARSE_TAG_SYMLINK=0xA000000C）的区别：
     junction 只能指向本地卷目录，常见于系统 XP 兼容链接（Local Settings 等）
-    和手动跨盘联接（如 .hermes → G:\\AI\\...）；
+    和手动跨盘联接（如 .local → G:\\AI\\...）；
     本工具迁移链接是 /D 符号链接优先（migrator._create_dir_link），
     按此区分可过滤"非本工具迁移产物"的 junction。
     """
@@ -283,165 +283,13 @@ def _is_generic_registry_text(text):
     return False
 
 
-# ===== 注册表/WMI 数据源缓存（异步补全性能优化） =====
-# 原实现：_match_registry_uninstall / _match_wmi_installed 每次调用都全量
-# 枚举注册表/查询 WMI，异步补全 538 个目录时重复查询 538 次，单次全表
-# 查询耗时数百毫秒到数秒，且 WMI 并发受限（多线程同时查会互相阻塞 +
-# 抛 WinError 2），这是异步补全 90+ 秒的真正根因。
-# 修复：首次调用时构建一次快照（带锁防并发重复构建），后续全部内存匹配。
-_REG_SNAPSHOT = None          # [(sub_name, display_name, install_location), ...] 注册表卸载项
-_REG_SNAPSHOT_LOCK = threading.Lock()
-_WMI_SNAPSHOT = None          # [(name, install_location), ...] WMI 已安装软件
-_WMI_SNAPSHOT_LOCK = threading.Lock()
-_WMI_UNAVAILABLE = False      # WMI 查询确认不可用后置 True，不再重试（避免 538 次失败查询）
-
-
-def _get_registry_snapshot():
-    """惰性构建注册表卸载项快照（线程安全，仅首次真实枚举）"""
-    global _REG_SNAPSHOT
-    if _REG_SNAPSHOT is not None:
-        return _REG_SNAPSHOT
-    with _REG_SNAPSHOT_LOCK:
-        if _REG_SNAPSHOT is not None:
-            return _REG_SNAPSHOT
-        snapshot = []
-        _build_failed = False
-        try:
-            import winreg
-            roots = [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-            ]
-            for root, subkey in roots:
-                try:
-                    key = winreg.OpenKey(root, subkey)
-                except OSError:
-                    continue
-                try:
-                    i = 0
-                    while True:
-                        try:
-                            sub_name = winreg.EnumKey(key, i)
-                            i += 1
-                        except OSError:
-                            break
-                        try:
-                            sub_key = winreg.OpenKey(key, sub_name)
-                        except OSError:
-                            continue
-                        try:
-                            display_name = ""
-                            install_loc = ""
-                            try:
-                                display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                            except OSError:
-                                pass
-                            try:
-                                install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
-                            except OSError:
-                                pass
-                            if display_name:
-                                snapshot.append((str(sub_name), str(display_name), str(install_loc or "")))
-                        finally:
-                            winreg.CloseKey(sub_key)
-                finally:
-                    winreg.CloseKey(key)
-        except Exception as e:
-            log.debug("忽略异常: %s", e)
-            _build_failed = True
-        if _build_failed:
-            # 构建失败不缓存，下次调用重试（避免永久缓存残缺数据）
-            return []
-        _REG_SNAPSHOT = snapshot
-        return snapshot
-
-
-def _get_wmi_snapshot():
-    """惰性构建 WMI 已安装软件快照（线程安全，仅首次真实查询）
-    查询确认不可用（类不存在/权限不足）后置 _WMI_UNAVAILABLE，
-    后续直接返回空列表，避免每次调用都重复失败查询。
-    """
-    global _WMI_SNAPSHOT, _WMI_UNAVAILABLE
-    if _WMI_UNAVAILABLE:
-        return []
-    if _WMI_SNAPSHOT is not None:
-        return _WMI_SNAPSHOT
-    with _WMI_SNAPSHOT_LOCK:
-        if _WMI_UNAVAILABLE:
-            return []
-        if _WMI_SNAPSHOT is not None:
-            return _WMI_SNAPSHOT
-        snapshot = []
-        _query_failed = False
-        _com_initialized = False
-        try:
-            # WMI 调用需要 COM 初始化。注意：CoInitialize 若返回 S_FALSE
-            # （线程已初始化）则不能 CoUninitialize，否则会破坏外层调用方
-            # 的 COM 状态（异步补全工作线程已各自初始化）。
-            try:
-                import pythoncom
-                hr = pythoncom.CoInitialize()
-                # S_OK=0 表示本次新初始化；S_FALSE=1 表示已初始化
-                _com_initialized = (hr == 0)
-            except Exception:
-                pass
-            try:
-                import win32com.client
-                wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-                svc = wmi.ConnectServer(".", "root\\cimv2")
-                try:
-                    items = svc.ExecQuery(
-                        "SELECT Name, Version, InstallLocation FROM Win32_InstalledWin32Program"
-                    )
-                except Exception:
-                    _query_failed = True
-                if not _query_failed:
-                    try:
-                        for item in items:
-                            try:
-                                name = str(item.Name or "")
-                                loc = ""
-                                try:
-                                    loc = str(item.InstallLocation or "")
-                                except Exception:
-                                    pass
-                                if name:
-                                    snapshot.append((name, loc))
-                            except Exception:
-                                continue
-                    except Exception:
-                        # 枚举失败（如类不可用 0x80041017）
-                        snapshot = []
-                        _query_failed = True
-            finally:
-                # 仅本次新初始化才 Uninitialize（避免破坏外层 COM 状态）
-                if _com_initialized:
-                    try:
-                        import pythoncom
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.debug("忽略异常: %s", e)
-            _query_failed = True
-        if _query_failed:
-            # WMI 不可用：缓存失败状态，后续不再重试
-            _WMI_UNAVAILABLE = True
-            _WMI_SNAPSHOT = []
-            return []
-        _WMI_SNAPSHOT = snapshot
-        return snapshot
-
-
 def _match_registry_uninstall(dir_path, dir_name):
     """从注册表卸载项匹配软件说明（最准确）
     遍历HKLM和HKCU的Uninstall键，双向匹配InstallLocation或DisplayName
     过滤系统组件描述（如 "Install Additional Tools for Node.js"）
     """
     try:
-        # 使用缓存快照（首次构建后纯内存匹配，避免 538 次全量枚举）
-        snapshot = _get_registry_snapshot()
+        import winreg
         # 待匹配的路径小写形式（规范化，去掉尾斜杠）
         path_lower = dir_path.lower().rstrip("\\").replace("\\\\", "\\")
         path_lower_norm = path_lower + "\\"  # 加尾斜杠用于子目录匹配
@@ -468,7 +316,7 @@ def _match_registry_uninstall(dir_path, dir_name):
         #       会错配到第一个子产品（如 Adobe Creative Cloud），但 Adobe 是容器目录，
         #       应该走第19层 _detect_vendor_container 识别为"Adobe 容器目录"或子产品分拆
         # 通用容器目录（Programs/Package Cache 等）同理：
-        #       Programs 下有 Ollama/TRAE/Edge 等多个子产品，InstallLocation 父目录匹配
+        #       Programs 下有 Ollama/Edge 等多个子产品，InstallLocation 父目录匹配
         #       会错配到 Ollama version 0.32.0 等具体产品
         _VENDOR_CONTAINER_DIRS = {
             'adobe', 'google', 'mozilla', 'tencent', 'netease', 'ncsoft',
@@ -487,31 +335,70 @@ def _match_registry_uninstall(dir_path, dir_name):
             (len(dir_name) < 4)
             or (dir_name.lower() in _GENERIC_DIR_NAMES_FOR_REGISTRY)
         )
-        # 检查3个卸载键位置（已由快照覆盖）
+        # 检查3个卸载键位置
+        roots = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        ]
         # 收集所有匹配结果，返回最精确的
         best_match = ""
         best_score = 0
-        for sub_name, display_name, install_loc in snapshot:
-            # 双向匹配InstallLocation
-            if install_loc and not is_vendor_container:
-                install_lower = install_loc.lower().rstrip("\\").replace("\\\\", "\\")
-                # 情况1: 待匹配目录是InstallLocation的父目录（如某厂商目录是其子产品的父目录）
-                # 厂商容器目录跳过此情况（is_vendor_container=True）避免 Adobe → AdobeCreativeCloud
-                if path_lower == install_lower or install_lower.startswith(path_lower_norm):
-                    if len(display_name) > best_score:
-                        best_match = display_name
-                        best_score = len(display_name)
-                # 情况2: 待匹配目录是InstallLocation的子目录
-                elif path_lower.startswith(install_lower + "\\"):
-                    if len(display_name) > best_score:
-                        best_match = display_name
-                        best_score = len(display_name)
-            # 其次匹配子键名包含dir_name（短词和厂商容器目录跳过避免误匹配）
-            if not skip_subname_match and dir_name and len(dir_name) >= 4:
-                if dir_name.lower() in sub_name.lower():
-                    if len(display_name) > best_score:
-                        best_match = display_name
-                        best_score = len(display_name)
+        for root, subkey in roots:
+            try:
+                key = winreg.OpenKey(root, subkey)
+            except OSError:
+                continue
+            try:
+                i = 0
+                while True:
+                    try:
+                        sub_name = winreg.EnumKey(key, i)
+                        i += 1
+                    except OSError:
+                        break
+                    try:
+                        sub_key = winreg.OpenKey(key, sub_name)
+                    except OSError:
+                        continue
+                    try:
+                        # 读取DisplayName和InstallLocation
+                        display_name = ""
+                        install_loc = ""
+                        try:
+                            display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
+                        except OSError as e:
+                            log.debug("忽略异常: %s", e)
+                        try:
+                            install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
+                        except OSError as e:
+                            log.debug("忽略异常: %s", e)
+                        if not display_name:
+                            continue
+                        # 双向匹配InstallLocation
+                        if install_loc and not is_vendor_container:
+                            install_lower = install_loc.lower().rstrip("\\").replace("\\\\", "\\")
+                            # 情况1: 待匹配目录是InstallLocation的父目录（如某厂商目录是其子产品的父目录）
+                            # 厂商容器目录跳过此情况（is_vendor_container=True）避免 Adobe → AdobeCreativeCloud
+                            if path_lower == install_lower or install_lower.startswith(path_lower_norm):
+                                if len(display_name) > best_score:
+                                    best_match = display_name
+                                    best_score = len(display_name)
+                            # 情况2: 待匹配目录是InstallLocation的子目录
+                            elif path_lower.startswith(install_lower + "\\"):
+                                if len(display_name) > best_score:
+                                    best_match = display_name
+                                    best_score = len(display_name)
+                        # 其次匹配子键名包含dir_name（短词和厂商容器目录跳过避免误匹配）
+                        if not skip_subname_match and dir_name and len(dir_name) >= 4:
+                            if dir_name.lower() in sub_name.lower():
+                                if len(display_name) > best_score:
+                                    best_match = display_name
+                                    best_score = len(display_name)
+                    finally:
+                        winreg.CloseKey(sub_key)
+            finally:
+                winreg.CloseKey(key)
         # 过滤系统组件描述（如 "Install Additional Tools for Node.js"）
         if _is_generic_registry_text(best_match):
             return ""
@@ -614,7 +501,7 @@ _VENDOR_CONTAINER_DIRS_FOR_FEATURE = {
     # 2026-07-20 新增（返回空字符串的厂商容器目录）
     'bytedance', 'openai', 'purpledome', 'reckfeng', 'sentry', 'softdeluxe',
     # 通用容器目录（多软件共用，应走第19层厂商容器判定，不应绑定到具体产品）
-    # Programs: LocalAppData\Programs 下有多个软件（如 TRAE/Edge/GLM-PC 等）
+    # Programs: LocalAppData\Programs 下有多个软件（如 Edge/GLM-PC 等）
     # Package Cache: 多个 MSI 安装包缓存目录
     'programs', 'package cache',
 }
@@ -1552,7 +1439,7 @@ def _match_installed_index(dir_name):
             return ""
         dl = dir_name.lower()
         # 厂商容器目录完全跳过此层（避免 Adobe/Tencent 等被错配到具体产品）
-        # 例：Tencent → StreamingService，cn.org.hermesagent.desktop → Docker Desktop
+        # 例：Tencent → StreamingService，cn.org.localagent.desktop → Docker Desktop
         # 这些目录应走第19层 _detect_vendor_container
         if dl in _VENDOR_CONTAINER_DIRS_FOR_FEATURE:
             return ""
@@ -1889,7 +1776,7 @@ def _match_winget_db(dir_name):
         # 4. 兜底：token 子集匹配（dir_name 所有单词都出现在 PackageName 中）
         # 使用驼峰分词：解决 PascalCase 目录名无法匹配带空格的软件名的问题
         # 反向域名包名（com.*/cn.*/dev.*/org.*/io.*）跳过此策略：
-        # 例：cn.org.hermesagent.desktop 不应按 token 子集匹配命中 "Docker Desktop"
+        # 例：cn.org.localagent.desktop 不应按 token 子集匹配命中 "Docker Desktop"
         #     com.pot-app.desktop 不应命中 "Docker Desktop"（pkg_id 后缀 desktop 误匹配）
         #     反向域名包名走第7层专门处理，winget 仅做精确匹配（策略 1/2/3）
         import re as _re_tok
@@ -2154,9 +2041,16 @@ def _match_wmi_installed(dir_path, dir_name):
     Win32_InstalledWin32Program 在 Win10+ 可用，失败则返回空
     """
     try:
-        # 使用缓存快照（首次构建后纯内存匹配，避免 538 次 WMI 全表查询）
-        items = _get_wmi_snapshot()
-        if not items:
+        import win32com.client
+        wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+        svc = wmi.ConnectServer(".", "root\\\\cimv2")
+        # Win32_InstalledWin32Program 比 Win32_Product 快很多（不触发MSI重新配置）
+        try:
+            items = svc.ExecQuery(
+                "SELECT Name, Version, InstallLocation FROM Win32_InstalledWin32Program"
+            )
+        except Exception:
+            # 旧系统无此类，降级为空
             return ""
         path_lower = dir_path.lower().rstrip("\\").replace("\\\\", "\\")
         path_lower_norm = path_lower + "\\"
@@ -2190,8 +2084,14 @@ def _match_wmi_installed(dir_path, dir_name):
         )
         best_match = ""
         best_score = 0
-        for name, install_loc in items:
+        for item in items:
             try:
+                name = item.Name or ""
+                install_loc = ""
+                try:
+                    install_loc = item.InstallLocation or ""
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
                 if not name:
                     continue
                 # 情况1: InstallLocation 双向匹配
