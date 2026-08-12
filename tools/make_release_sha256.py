@@ -33,7 +33,8 @@ def main(argv):
             continue
         digest = sha256_file(p)
         out = p.with_name(p.name + ".sha256")
-        out.write_text(f"{digest}  {p.name}\n", encoding="ascii")
+        # utf-8：文件名可能含中文（如 C盘拦迁器.exe）
+        out.write_text(f"{digest}  {p.name}\n", encoding="utf-8")
         print(f"{digest}  {p.name}  ->  {out}")
     return 0
 
