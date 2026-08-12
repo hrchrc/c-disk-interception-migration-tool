@@ -5,28 +5,28 @@
 # 降低 360 等启发式杀软对未签名 exe 的误报率
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    productvers=(1, 0, 0, 0),
+    filevers=(0, 4, 0, 0),
+    prodvers=(0, 4, 0, 0),
     mask=0x3f,
     flags=0x0,
-    OS=0x40004,        # VOS_NT_WINDOWS32
-    fileType=0x1,      # VFT_APP
-    subtype=0x0,       # VFT2_UNKNOWN
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
     date=(0, 0),
   ),
   kids=[
     StringFileInfo([
       StringTable(
-        '080404b0',   # 简体中文, UTF-16
+        '080404b0',
         [
           StringStruct('CompanyName', 'CDriveMigrator'),
-          StringStruct('FileDescription', 'C盘拦迁器'),
-          StringStruct('FileVersion', '1.0.0.0'),
+          StringStruct('FileDescription', 'C Drive Relocator'),
+          StringStruct('FileVersion', '0.4.0.0'),
           StringStruct('InternalName', 'C盘拦迁器'),
           StringStruct('LegalCopyright', 'Copyright (C) 2026 CDriveMigrator'),
           StringStruct('OriginalFilename', 'C盘拦迁器.exe'),
-          StringStruct('ProductName', 'C盘拦迁器'),
-          StringStruct('ProductVersion', '1.0.0.0'),
+          StringStruct('ProductName', 'C Drive Relocator'),
+          StringStruct('ProductVersion', '0.4.0.0'),
         ]
       ),
     ]),

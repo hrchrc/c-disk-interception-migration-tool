@@ -124,7 +124,7 @@ class ScanHandler:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 _t0 = _time.perf_counter()
                 _dbg.info("[异步补全] 线程 run() 进入")
-                self.log_signal.emit(f"[异步补全] 启动：待识别 {len(self.paths)} 个目录（4路并行+5秒超时）")
+                self.log_signal.emit(f"[异步补全] 启动：待识别 {len(self.paths)} 个目录（8路并行+5秒超时）")
                 # 后台线程使用 win32com（lnk读取、WMI查询）必须初始化COM，否则segfault
                 import pythoncom
                 try:
@@ -162,7 +162,7 @@ class ScanHandler:
                                 pass
 
                     # 4 路并行识别
-                    executor = ThreadPoolExecutor(max_workers=4)
+                    executor = ThreadPoolExecutor(max_workers=8)
                     try:
                         futures = {executor.submit(_identify_one, p): p for p in self.paths}
                         for future in as_completed(futures):
@@ -269,10 +269,14 @@ class ScanHandler:
                 self.cfg["desc_cache"][path] = desc
                 if not desc:
                     return
-                for s in self.cfg.get("scan_cache", []):
-                    if s.get("path") == path:
-                        s["desc"] = desc
-                        break
+                # O(1) 查找替代 O(n) 遍历
+                _scan_cache_map = getattr(self, '_scan_cache_map', None)
+                if _scan_cache_map is None:
+                    _scan_cache_map = {s.get("path", ""): s for s in self.cfg.get("scan_cache", [])}
+                    self._scan_cache_map = _scan_cache_map
+                s = _scan_cache_map.get(path)
+                if s:
+                    s["desc"] = desc
                 # 加入缓冲，延迟批量更新表格
                 _fill_buffer.append((path, desc))
                 nonlocal _fill_timer
