@@ -88,7 +88,12 @@ fn make_record(spec: &MockSpec) -> Vec<u8> {
             put_u32(&mut rec, pos + 4, attr_len as u32);
             rec[pos + 8] = 1; // 非驻留
             put_u16(&mut rec, pos + 0x20, 0x40); // run list offset
-            put_u64(&mut rec, pos + 0x30, spec.size); // real size
+            // 非驻留 $DATA 大小字段（与 mft_index.rs 读取逻辑一致）：
+            // 0x28 = AllocatedSize（实际占用，mft_index 读取它统计真实占用）
+            // 0x30 = DataLength（文件逻辑大小，测试原始字节供 Python 侧对照）
+            // 普通非稀疏文件两者相等
+            put_u64(&mut rec, pos + 0x28, spec.size); // allocated size
+            put_u64(&mut rec, pos + 0x30, spec.size); // data length
             pos += attr_len;
         } else {
             let data_len = 0x18 + 0x18;
