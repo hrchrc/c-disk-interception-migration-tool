@@ -184,14 +184,14 @@ class NotifyBubble(QWidget):
         card.setObjectName("bubbleCard")
         card.setStyleSheet("""
             #bubbleCard { background: rgba(38, 38, 38, 235); border: 1px solid #555;
-                          border-radius: 8px; }
-            #bubbleTitle { color: #FFD54F; font-weight: bold; font-size: 13px; }
-            #bubbleMsg { color: #EEEEEE; font-size: 12px; }
+                          border-radius: 10px; }
+            #bubbleTitle { color: #FFD54F; font-weight: bold; font-size: 15px; }
+            #bubbleMsg { color: #EEEEEE; font-size: 14px; }
             QPushButton#bubbleBtn { background: #4E6EF2; color: white; border: none;
-                                    border-radius: 4px; padding: 4px 10px; font-size: 12px; }
+                                    border-radius: 4px; padding: 5px 12px; font-size: 13px; }
             QPushButton#bubbleBtn:hover { background: #5B7BFF; }
             QPushButton#bubbleClose { background: transparent; color: #AAAAAA;
-                                      border: none; font-size: 14px; padding: 0 4px; }
+                                      border: none; font-size: 15px; padding: 0 4px; }
             QPushButton#bubbleClose:hover { color: white; }
         """)
 
@@ -201,15 +201,15 @@ class NotifyBubble(QWidget):
             tr = lambda t: t  # noqa: E731
 
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(6)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(8)
         title_lbl = QLabel(tr(title))
         title_lbl.setObjectName("bubbleTitle")
         msg_lbl = QLabel(message)
         msg_lbl.setObjectName("bubbleMsg")
         msg_lbl.setWordWrap(True)
         msg_lbl.setTextFormat(Qt.PlainText)  # 路径可能含 < > &，强制纯文本避免按 HTML 解析
-        msg_lbl.setMaximumWidth(340)
+        msg_lbl.setMaximumWidth(460)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
         btn_dont = QPushButton(tr("不再提醒"))

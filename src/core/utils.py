@@ -283,16 +283,116 @@ def _is_generic_registry_text(text):
     return False
 
 
+# ===== 注册表数据源快照 + 路径索引 =====
+# 回退版每次调用全量枚举 Uninstall 注册表（3 个根键），异步补全数百目录时重复
+# 枚举数百次拖慢补全。修复：首次调用构建一次快照 + InstallLocation 路径
+# 索引（线程安全），后续调用纯内存匹配。
+_REG_SNAPSHOT = None          # [(sub_name, display_name, install_location), ...]
+_REG_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _get_registry_snapshot():
+    """惰性构建注册表卸载项快照（线程安全，仅首次真实枚举）"""
+    global _REG_SNAPSHOT
+    if _REG_SNAPSHOT is not None:
+        return _REG_SNAPSHOT
+    with _REG_SNAPSHOT_LOCK:
+        if _REG_SNAPSHOT is not None:
+            return _REG_SNAPSHOT
+        snapshot = []
+        _build_failed = False
+        try:
+            import winreg
+            roots = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            ]
+            for root, subkey in roots:
+                try:
+                    key = winreg.OpenKey(root, subkey)
+                except OSError:
+                    continue
+                try:
+                    i = 0
+                    while True:
+                        try:
+                            sub_name = winreg.EnumKey(key, i)
+                            i += 1
+                        except OSError:
+                            break
+                        try:
+                            sub_key = winreg.OpenKey(key, sub_name)
+                        except OSError:
+                            continue
+                        try:
+                            display_name = ""
+                            install_loc = ""
+                            try:
+                                display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
+                            except OSError:
+                                pass
+                            try:
+                                install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
+                            except OSError:
+                                pass
+                            if display_name:
+                                snapshot.append((str(sub_name), str(display_name), str(install_loc or "")))
+                        finally:
+                            winreg.CloseKey(sub_key)
+                finally:
+                    winreg.CloseKey(key)
+        except Exception as e:
+            log.debug("忽略异常: %s", e)
+            _build_failed = True
+        if _build_failed:
+            # 构建失败不缓存，下次调用重试（避免永久缓存残缺数据）
+            return []
+        _REG_SNAPSHOT = snapshot
+        return snapshot
+
+
+_REG_LOC_PREFIX = None        # {install_loc 各级真前缀_lower: [display_name, ...]}
+_REG_LOC_EXACT = None         # {install_loc 自身_lower: [display_name, ...]}
+_REG_LOC_INDEX_LOCK = threading.Lock()
+
+
+def _build_registry_loc_index():
+    """构建 InstallLocation 路径索引（自身 + 全部祖先前缀），双向匹配 O(1) 查询"""
+    global _REG_LOC_PREFIX, _REG_LOC_EXACT
+    if _REG_LOC_EXACT is not None:
+        return _REG_LOC_PREFIX, _REG_LOC_EXACT
+    with _REG_LOC_INDEX_LOCK:
+        if _REG_LOC_EXACT is not None:
+            return _REG_LOC_PREFIX, _REG_LOC_EXACT
+        prefix, exact = {}, {}
+        for _sub_name, _display_name, _install_loc in _get_registry_snapshot():
+            if not _install_loc or not _display_name:
+                continue
+            loc = _install_loc.lower().rstrip("\\").replace("\\\\", "\\")
+            if not loc:
+                continue
+            exact.setdefault(loc, []).append(_display_name)
+            parts = loc.split("\\")
+            cur = ""
+            for part in parts:
+                cur = cur + "\\" + part if cur else part
+                if cur != loc:
+                    prefix.setdefault(cur, []).append(_display_name)
+        _REG_LOC_PREFIX, _REG_LOC_EXACT = prefix, exact
+    return _REG_LOC_PREFIX, _REG_LOC_EXACT
+
+
 def _match_registry_uninstall(dir_path, dir_name):
     """从注册表卸载项匹配软件说明（最准确）
     遍历HKLM和HKCU的Uninstall键，双向匹配InstallLocation或DisplayName
     过滤系统组件描述（如 "Install Additional Tools for Node.js"）
+    性能：快照 + 路径索引匹配（首次构建后纯内存 O(1)，不再每次全量枚举注册表）
     """
     try:
-        import winreg
+        snapshot = _get_registry_snapshot()
         # 待匹配的路径小写形式（规范化，去掉尾斜杠）
         path_lower = dir_path.lower().rstrip("\\").replace("\\\\", "\\")
-        path_lower_norm = path_lower + "\\"  # 加尾斜杠用于子目录匹配
         # 通用词目录名黑名单：避免厂商容器目录/通用词目录被注册表反查错配到具体产品
         # 例：Adobe → 匹配 "Adobe Creative Cloud"，Google → 匹配任何含 google 的软件
         #     Mozilla → 匹配 "Mozilla Firefox"，Netease → 匹配 "网易 Et"
@@ -335,70 +435,35 @@ def _match_registry_uninstall(dir_path, dir_name):
             (len(dir_name) < 4)
             or (dir_name.lower() in _GENERIC_DIR_NAMES_FOR_REGISTRY)
         )
-        # 检查3个卸载键位置
-        roots = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-        ]
-        # 收集所有匹配结果，返回最精确的
+        # 收集所有匹配结果，返回最精确的（与全量枚举版逐条等价的取最长逻辑）
         best_match = ""
         best_score = 0
-        for root, subkey in roots:
-            try:
-                key = winreg.OpenKey(root, subkey)
-            except OSError:
-                continue
-            try:
-                i = 0
-                while True:
-                    try:
-                        sub_name = winreg.EnumKey(key, i)
-                        i += 1
-                    except OSError:
-                        break
-                    try:
-                        sub_key = winreg.OpenKey(key, sub_name)
-                    except OSError:
-                        continue
-                    try:
-                        # 读取DisplayName和InstallLocation
-                        display_name = ""
-                        install_loc = ""
-                        try:
-                            display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                        except OSError as e:
-                            log.debug("忽略异常: %s", e)
-                        try:
-                            install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
-                        except OSError as e:
-                            log.debug("忽略异常: %s", e)
-                        if not display_name:
-                            continue
-                        # 双向匹配InstallLocation
-                        if install_loc and not is_vendor_container:
-                            install_lower = install_loc.lower().rstrip("\\").replace("\\\\", "\\")
-                            # 情况1: 待匹配目录是InstallLocation的父目录（如某厂商目录是其子产品的父目录）
-                            # 厂商容器目录跳过此情况（is_vendor_container=True）避免 Adobe → AdobeCreativeCloud
-                            if path_lower == install_lower or install_lower.startswith(path_lower_norm):
-                                if len(display_name) > best_score:
-                                    best_match = display_name
-                                    best_score = len(display_name)
-                            # 情况2: 待匹配目录是InstallLocation的子目录
-                            elif path_lower.startswith(install_lower + "\\"):
-                                if len(display_name) > best_score:
-                                    best_match = display_name
-                                    best_score = len(display_name)
-                        # 其次匹配子键名包含dir_name（短词和厂商容器目录跳过避免误匹配）
-                        if not skip_subname_match and dir_name and len(dir_name) >= 4:
-                            if dir_name.lower() in sub_name.lower():
-                                if len(display_name) > best_score:
-                                    best_match = display_name
-                                    best_score = len(display_name)
-                    finally:
-                        winreg.CloseKey(sub_key)
-            finally:
-                winreg.CloseKey(key)
+        if not is_vendor_container:
+            # InstallLocation 双向匹配走索引（等价原逻辑，见 _build_registry_loc_index）：
+            #   情况1: path == install_loc 或 path 是 install_loc 的前缀 → prefix/exact 索引命中
+            #   情况2: path 是 install_loc 的子目录 → install_loc 是 path 的祖先 → exact 索引查祖先链
+            _prefix_idx, _exact_idx = _build_registry_loc_index()
+            for _dn in _prefix_idx.get(path_lower, ()):
+                if len(_dn) > best_score:
+                    best_match, best_score = _dn, len(_dn)
+            for _dn in _exact_idx.get(path_lower, ()):
+                if len(_dn) > best_score:
+                    best_match, best_score = _dn, len(_dn)
+            _cur = os.path.dirname(path_lower)
+            while _cur and _cur != path_lower:
+                for _dn in _exact_idx.get(_cur, ()):
+                    if len(_dn) > best_score:
+                        best_match, best_score = _dn, len(_dn)
+                _parent = os.path.dirname(_cur)
+                if _parent == _cur or not _parent:
+                    break
+                _cur = _parent
+        # 子键名包含 dir_name 匹配（子串无法索引，保留快照遍历；命中目录少）
+        if not skip_subname_match and dir_name and len(dir_name) >= 4:
+            for _sub_name, _display_name, _install_loc in snapshot:
+                if dir_name.lower() in _sub_name.lower():
+                    if len(_display_name) > best_score:
+                        best_match, best_score = _display_name, len(_display_name)
         # 过滤系统组件描述（如 "Install Additional Tools for Node.js"）
         if _is_generic_registry_text(best_match):
             return ""
@@ -1597,6 +1662,91 @@ def _build_winget_name_index():
     return _WINGET_NAME_INDEX
 
 
+# ---- 策略3 后缀索引 + 策略4 token 预计算 ----
+# _match_winget_db 策略3/4 每次调用全遍历 19421 条（策略4 还逐条重新驼峰分词），
+# 高频识别时累计耗时显著。索引一次性构建（约 0.06s），查询变 O(1)。
+_WINGET_SUFFIX_INDEX = None       # {pkg_id最后一段: [pkg_id, ...]}
+_WINGET_SUFFIX_INDEX_LOCK = None
+_WINGET_NAME_TOKENS = None        # {pkg_id: tokens}，策略4 预分词缓存
+_WINGET_NAME_TOKENS_LOCK = None
+
+
+def _build_winget_suffix_index():
+    """构建 pkg_id 后缀索引（{最后一段: [pkg_id, ...]}），惰性一次性构建，线程安全"""
+    global _WINGET_SUFFIX_INDEX, _WINGET_SUFFIX_INDEX_LOCK
+    if _WINGET_SUFFIX_INDEX is not None:
+        return _WINGET_SUFFIX_INDEX
+    if _WINGET_SUFFIX_INDEX_LOCK is None:
+        import threading as _t
+        _WINGET_SUFFIX_INDEX_LOCK = _t.Lock()
+    with _WINGET_SUFFIX_INDEX_LOCK:
+        if _WINGET_SUFFIX_INDEX is not None:
+            return _WINGET_SUFFIX_INDEX
+        db = _load_winget_db()
+        idx = {}
+        if db:
+            for pkg_id in db:
+                if "." in pkg_id:
+                    idx.setdefault(pkg_id.rsplit(".", 1)[-1], []).append(pkg_id)
+        _WINGET_SUFFIX_INDEX = idx
+    return _WINGET_SUFFIX_INDEX
+
+
+def _build_winget_name_tokens():
+    """预计算 winget DB 所有 name 的驼峰分词（策略4 复用，不再每次对 19421 条重新分词）"""
+    global _WINGET_NAME_TOKENS, _WINGET_NAME_TOKENS_LOCK
+    if _WINGET_NAME_TOKENS is not None:
+        return _WINGET_NAME_TOKENS
+    if _WINGET_NAME_TOKENS_LOCK is None:
+        import threading as _t
+        _WINGET_NAME_TOKENS_LOCK = _t.Lock()
+    with _WINGET_NAME_TOKENS_LOCK:
+        if _WINGET_NAME_TOKENS is not None:
+            return _WINGET_NAME_TOKENS
+        db = _load_winget_db()
+        cache = {}
+        if db:
+            for pkg_id, entry in db.items():
+                name = entry.get("name", "")
+                if name:
+                    cache[pkg_id] = _tokenize_with_camel(name)
+        _WINGET_NAME_TOKENS = cache
+    return _WINGET_NAME_TOKENS
+
+
+# ---- 策略4 token 倒排索引 ----
+# 原策略4 每次调用全遍历 19421 条做集合运算（纯 Python，GIL 串行，
+# 高频识别时耗时显著）。
+# 倒排索引 {token: set(pkg_id)}：查询时对 dir_tokens 取集合交集，
+# 候选通常几个~几十个，且交集数学上等价于原"dir_tokens ⊆ name_tokens"条件。
+_WINGET_TOKEN_INDEX = None       # {token: set(pkg_id, ...)}
+_WINGET_TOKEN_INDEX_LOCK = None
+_WINGET_PKG_ORDER = None         # {pkg_id: db 顺序号}，选最短 name 同长取先（与全遍历版一致）
+
+
+def _build_winget_token_index():
+    """构建 winget name token 倒排索引 + pkg 顺序号（惰性一次性，线程安全）"""
+    global _WINGET_TOKEN_INDEX, _WINGET_TOKEN_INDEX_LOCK, _WINGET_PKG_ORDER
+    if _WINGET_TOKEN_INDEX is not None:
+        return _WINGET_TOKEN_INDEX, _WINGET_PKG_ORDER
+    if _WINGET_TOKEN_INDEX_LOCK is None:
+        import threading as _t
+        _WINGET_TOKEN_INDEX_LOCK = _t.Lock()
+    with _WINGET_TOKEN_INDEX_LOCK:
+        if _WINGET_TOKEN_INDEX is not None:
+            return _WINGET_TOKEN_INDEX, _WINGET_PKG_ORDER
+        tok_cache = _build_winget_name_tokens()
+        idx = {}
+        order = {}
+        for i, pkg_id in enumerate(tok_cache):
+            order[pkg_id] = i
+            for tok in tok_cache[pkg_id]:
+                idx.setdefault(tok, set()).add(pkg_id)
+        _WINGET_TOKEN_INDEX = idx
+        _WINGET_PKG_ORDER = order
+    return _WINGET_TOKEN_INDEX, _WINGET_PKG_ORDER
+
+
 def _lookup_winget_by_display_name(display_name):
     """用 DisplayName 反查 winget DB，返回三元组 (name, desc, type)，失败返回空元组
 
@@ -1758,17 +1908,16 @@ def _match_winget_db(dir_name):
                 if triple and not _is_vague_desc_static(triple[0]):
                     return triple
         # 3. 目录名等于 PackageIdentifier 最后一段（点号后的部分）
-        #    该策略按 pkg_id 后缀匹配，无法用 name 索引优化，仍需遍历
+        #    索引化：后缀索引 O(1) 取候选（同后缀包通常 1-3 个），避免每次全遍历 19421 条
         best_entry = None
-        for pkg_id, entry in db.items():
+        cands = _build_winget_suffix_index().get(dl, ())
+        for pkg_id in cands:
+            entry = db.get(pkg_id) or {}
             name = entry.get("name", "")
             if not name or _is_vague_desc_static(name):
                 continue
-            if "." in pkg_id:
-                suffix = pkg_id.rsplit(".", 1)[-1]
-                if suffix == dl:
-                    if best_entry is None or len(name) > len(best_entry.get("name", "")):
-                        best_entry = entry
+            if best_entry is None or len(name) > len(best_entry.get("name", "")):
+                best_entry = entry
         if best_entry:
             return (best_entry.get("name", ""),
                     best_entry.get("desc", ""),
@@ -1808,15 +1957,27 @@ def _match_winget_db(dir_name):
         raw_dir_tokens = set(_re_tok.split(r'[\s\-_\.]+', dl)) - {''}
         is_single_token = len(raw_dir_tokens) == 1
         token_best_entry = None
-        for pkg_id, entry in db.items():
+        tok_cache = _build_winget_name_tokens()
+        # 倒排索引查询：候选 = 含全部 dir_tokens 的包（集合交集），
+        # 数学上等价于原"dir_tokens ⊆ name_tokens"全遍历条件；候选通常几个~几十个。
+        # 排序保持 db 顺序（选最短 name 同长取先，与全遍历版结果一致）
+        _inv, _order = _build_winget_token_index()
+        _cand = None
+        for _tok in dir_tokens:
+            _s = _inv.get(_tok)
+            if not _s:
+                _cand = None
+                break
+            _cand = _s if _cand is None else (_cand & _s)
+            if not _cand:
+                break
+        for pkg_id in (sorted(_cand, key=_order.get) if _cand else ()):
+            entry = db.get(pkg_id) or {}
             name = entry.get("name", "")
             if not name or _is_vague_desc_static(name):
                 continue
-            name_tokens = _tokenize_with_camel(name)
+            name_tokens = tok_cache.get(pkg_id)
             if not name_tokens:
-                continue
-            # dir_tokens 必须是 name_tokens 的子集
-            if not dir_tokens.issubset(name_tokens):
                 continue
             # name_tokens 数量只能比 dir_tokens 多 1-4 个（避免无限制扩展匹配）
             extra = len(name_tokens) - len(dir_tokens)

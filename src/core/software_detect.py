@@ -623,13 +623,10 @@ def get_dir_description(dir_path):
     #              抢在 KNOWN_SOFTWARE_DIRS 之前，避免被笼统关键字说明拦截；
     #              立即拿到 type 触发 type × position 矩阵生成差异化描述
     # 注：用 dir_name_raw（原始大小写）以支持驼峰分词（EpicGames → epic+games）
+    # G7 前置层已用相同参数（dir_name_raw）调用过 _match_winget_db
+    # 且未命中（命中则已提前返回），此层再调用结果必然相同，删除重复的全库遍历
+    # （每目录省一次 19421 条全遍历）
     _enter_layer("2. winget软件数据库", dir_path)
-    winget_result = _match_winget_db(dir_name_raw)
-    if winget_result:
-        winget_name, winget_desc, winget_type = winget_result
-        display = winget_desc if winget_desc else winget_name
-        return _return_desc(display, "winget软件数据库",
-                            type_val=winget_type, software_name=winget_name)
 
     # 3. 目录名精确匹配/包含匹配已知软件库（KNOWN_SOFTWARE_DIRS）
     # 学习缓存的关键字匹配，长关键字优先

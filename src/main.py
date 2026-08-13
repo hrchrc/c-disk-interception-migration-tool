@@ -508,7 +508,24 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         title_sub.setStyleSheet(
             "font-size: 12px; color: #757575; background: transparent;")
         title_box.addWidget(title_main)
-        title_box.addWidget(title_sub)
+        # 副标题行：介绍词 + 免责声明（右侧，同排）
+        # 免责声明：部分操作涉及系统底层（文件索引/链接迁移），可能触发安全软件提示；
+        # 文案双语（i18n 翻译表），hover 显示完整说明
+        sub_row = QHBoxLayout()
+        sub_row.setSpacing(10)
+        sub_row.addWidget(title_sub)
+        _disc_note = tr("注意：")
+        _disc_body = tr("部分操作可能触发安全软件提示；本软件无毒、无后台程序，可查源码")
+        disclaimer = QLabel(
+            f'<span style="color:#E53935; font-weight:bold; font-size:12px;">{_disc_note}</span>'
+            f'<span style="color:#757575; font-size:12px;">{_disc_body}</span>')
+        disclaimer.setStyleSheet("background: transparent;")
+        disclaimer.setToolTip(tr(
+            "本软件部分操作（如深层文件索引、目录链接迁移）涉及系统底层，"
+            "可能触发安全软件提醒。本软件无毒、无任何后台程序、不联网上传数据，"
+            "源码可供查验。"))
+        sub_row.addWidget(disclaimer)
+        title_box.addLayout(sub_row)
         header_layout.addLayout(title_box)
         header_layout.addStretch()
 

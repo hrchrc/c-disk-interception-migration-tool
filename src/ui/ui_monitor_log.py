@@ -102,12 +102,15 @@ class MonitorLogHandler:
         if reason == QSystemTrayIcon.DoubleClick:
             self.show_and_raise()
 
-    def on_monitor_log(self, event_type, message):
+    def on_monitor_log(self, event_type, message, update_status=True):
         """监控日志 - 不同事件类型用不同颜色，中英文双语标签
         同时写入独立的 监控日志.log 文件（不混入Python logging的[INFO]等）
 
         防抖优化：高频日志（如 复制引擎每 500 文件一次）时，UI 渲染限频到
         每 500ms 一次，避免 561 次重绘导致 UI 假死。
+
+        :param update_status: 是否同步写状态栏。异步补全等场景的状态栏由
+            提示逻辑独占（避免日志覆盖"请耐心等待"提示），传 False 只进日志区。
         """
         full_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # cache 存原文（渲染时翻译：切换语言后重新渲染即新语言）；
@@ -117,8 +120,9 @@ class MonitorLogHandler:
         self._monitor_log_cache.append((full_ts, event_type, message))
         if len(self._monitor_log_cache) > 1000:
             self._monitor_log_cache = self._monitor_log_cache[-1000:]
-        # 状态栏立即更新（轻量操作）
-        self.status_label.setText(tr(message))
+        # 状态栏立即更新（轻量操作；update_status=False 时不写，如异步补全提示独占）
+        if update_status:
+            self.status_label.setText(tr(message))
         # 写入日志文件（IO 操作，不阻塞 UI）
         # 注：message 可能含 \n（如 alert 的多行消息），写入文件会破坏
         # "[时间] [类型] 消息" 的单行格式，导致刷新时正则不匹配变 unknown。

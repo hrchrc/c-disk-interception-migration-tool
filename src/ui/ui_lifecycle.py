@@ -592,9 +592,10 @@ class LifecycleHandler:
             save_all(self.cfg)
             logger.info("[清空缓存] 步骤3: 删除识别记录.json")
             try:
-                from config import RECOGNITION_LOG_FILE
-                if RECOGNITION_LOG_FILE.exists():
-                    RECOGNITION_LOG_FILE.unlink()
+                # 用 clear_recognition_log 同步清内存缓冲 + 文件，
+                # 防止缓冲残留被下次 flush 写回（批量写盘引入）
+                from config import clear_recognition_log
+                clear_recognition_log()
             except Exception as e:
                 logger.warning(f"[清空缓存] 删除识别记录异常(忽略): {e}")
             logger.info("[清空缓存] 步骤3.5: 删除 AI 识别缓存文件 ai_recognize_cache.json")
@@ -617,11 +618,12 @@ class LifecycleHandler:
             logger.info("[清空缓存] 步骤5: 更新统计标签")
             self._update_stats(scan_count=0)
             logger.info("[清空缓存] 步骤6: 更新状态栏")
-            self.status_label.setText("缓存已清空，正在后台预加载 MFT 索引...")
+            # 移除自动 MFT 预加载：MftScanner.load() 直接读 $MFT 主文件表，
+            # 360 行为链检测会把它与 bat 启动关联并弹"风险程序"告警；
+            # 改为用户点『刷新待迁移』时由 ScanWorker 按需加载（本来就有该路径）
+            self.status_label.setText("缓存已清空，请点击『刷新待迁移』重新扫描")
             self.on_monitor_log("init", "已清空扫描缓存和识别记录")
-            logger.info("[清空缓存] 全部完成，启动 MFT 预加载")
-            # 方案A：清空缓存后自动后台加载 MFT 索引，避免下次刷新待迁移时退回 os.walk 慢扫
-            QTimer.singleShot(300, self._preload_mft_after_clear)
+            logger.info("[清空缓存] 全部完成")
         except BaseException as e:
             # 捕获 BaseException 以便记录所有类型的异常（含 SystemExit 等）
             import traceback

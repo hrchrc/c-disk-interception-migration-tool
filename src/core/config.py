@@ -10,6 +10,7 @@ import shutil
 import logging
 import ctypes
 import copy
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -194,25 +195,63 @@ def _load_software_dict():
         return empty
 
 
+# 识别记录写文件锁 + 内存缓冲：
+# 高频识别（异步补全数百目录）时不再每条"读-改-写"整个文件——
+# 数百次全文件 IO 会拖慢补全且大幅增加磁盘负载。
+# 改为内存累积（worker 只 O(1) 更新 dict），累积 50 条或补全结束（flush）才写盘一次。
+_RECOGNITION_LOG_LOCK = threading.Lock()
+_RECOGNITION_BUFFER = {}             # dir_path -> 记录 dict（未落盘部分）
+_RECOGNITION_FLUSH_THRESHOLD = 50    # 累积 50 条写盘一次
+
+
 def _record_recognition(dir_path, description, method):
-    """把识别到的软件/目录记录到 识别记录.json"""
+    """把识别到的软件/目录记录到 识别记录.json（线程安全 + 批量写盘）"""
     try:
-        data = {}
-        if RECOGNITION_LOG_FILE.exists():
-            try:
-                with open(RECOGNITION_LOG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        data[dir_path] = {
+        rec = {
             "description": description,
             "method": method,
             "dir_name": os.path.basename(dir_path),
             "updated_at": ts
         }
-        with open(RECOGNITION_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        flush = False
+        with _RECOGNITION_LOG_LOCK:
+            _RECOGNITION_BUFFER[dir_path] = rec
+            flush = len(_RECOGNITION_BUFFER) >= _RECOGNITION_FLUSH_THRESHOLD
+        if flush:
+            flush_recognition_log()
+    except Exception:
+        pass
+
+
+def flush_recognition_log():
+    """把识别记录缓冲合并写盘（幂等；补全完成/程序退出前调用确保不丢）"""
+    try:
+        with _RECOGNITION_LOG_LOCK:
+            if not _RECOGNITION_BUFFER:
+                return
+            data = {}
+            if RECOGNITION_LOG_FILE.exists():
+                try:
+                    with open(RECOGNITION_LOG_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            data.update(_RECOGNITION_BUFFER)
+            with open(RECOGNITION_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            _RECOGNITION_BUFFER.clear()
+    except Exception:
+        pass
+
+
+def clear_recognition_log():
+    """清空识别记录：内存缓冲 + 文件（『清空缓存』调用；防止缓冲残留被下次 flush 写回）"""
+    try:
+        with _RECOGNITION_LOG_LOCK:
+            _RECOGNITION_BUFFER.clear()
+        if RECOGNITION_LOG_FILE.exists():
+            RECOGNITION_LOG_FILE.unlink()
     except Exception:
         pass
 
