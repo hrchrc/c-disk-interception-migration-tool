@@ -26,7 +26,7 @@ assignees: ''
 
 ## 环境
 
-- 版本：v0.04
+- 版本：v0.05
 - Windows 版本：
 - 目标盘文件系统（NTFS/FAT32/exFAT）：
 

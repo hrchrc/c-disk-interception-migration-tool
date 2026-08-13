@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_NAME = "C盘拦迁器"
-APP_VERSION = "0.04"
+APP_VERSION = "0.05"
 
 # #28:配置文件版本号(config.json/state.json 各自独立版本,结构变更时递增,
 # 加载时检查:文件版本高于程序支持→警告降级加载;低于→执行迁移扩展点)
