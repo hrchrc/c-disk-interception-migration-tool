@@ -1030,9 +1030,10 @@ class Migrator:
         first_err = None  # (code, reason, suggestion, file) 取第一个 file_error
         cancelled_by_engine = False
         file_errors = []  # 所有 file_error 事件（用于完成时摘出失败文件）
+        _mismatch_count = 0  # 校验不一致累计数（累加展示，避免逐文件刷屏）
 
         def on_event(evt):
-            nonlocal file_count, last_report, first_err, cancelled_by_engine
+            nonlocal file_count, last_report, first_err, cancelled_by_engine, _mismatch_count
             event = evt.get("event")
             if event == "progress":
                 files_done = evt.get("files_done", 0)
@@ -1077,6 +1078,26 @@ class Migrator:
                 # 续传校验未通过(断电/损坏,ckpt 不可信)→ 整文件重传提示(引擎发出)
                 # 用户可见:明确告知上次进度作废,数据完整性由重传保证
                 self._emit_log("warn", f"  ♻️ {evt.get('value', '')}")
+            elif event == "info" and evt.get("key") == "verify_start":
+                # BLAKE3 校验开始（copy+verify 一体进入校验阶段）
+                # 与复制进度同 accumulate key 原地替换：📦 已复制 → 🔍 校验中
+                val = evt.get("value", "")
+                self._emit_log("accumulate:migrate:copy_progress",
+                    f"  🔍 BLAKE3 校验{val}")
+            elif event == "info" and evt.get("key") == "verify":
+                # BLAKE3 校验完成（copy+verify 一体，引擎在校验完成后发此事件）
+                # 用与复制进度相同的 accumulate key 原地替换进度行：
+                # 日志区一行进度演变（📦 已复制 → 🔍 校验中 → 🔍 校验完成），状态栏同步更新
+                val = evt.get("value", "")
+                self._emit_log("accumulate:migrate:copy_progress",
+                    f"  🔍 BLAKE3 校验{val}")
+            elif event == "verify_mismatch":
+                # 校验不一致（内容与源不同）：累加汇总（累计数 + 最近文件），不刷屏
+                _mismatch_count += 1
+                err_path = evt.get("path", "?")
+                self._emit_log("accumulate:warn:verify_mismatch",
+                    f"  ⚠️ BLAKE3 校验不一致（内容与源不同）：第 {_mismatch_count} 个，"
+                    f"最近: {err_path}")
             elif event == "cancelled":
                 cancelled_by_engine = True
 

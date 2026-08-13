@@ -68,6 +68,14 @@ pub fn verify_tree(
         return Ok(VerifyStats::default());
     }
 
+    // 校验开始标记：copy+verify 一体时供 UI 区分"复制阶段→校验阶段"
+    // （复制完成事件与校验事件同构，无此标记 UI 无法切换进度文案）
+    Event::Info {
+        key: "verify_start".to_string(),
+        value: format!("开始: {} 个文件", total),
+    }
+    .emit();
+
     // 2. 并行校验:原子取任务下标,每 worker 线程独立处理
     let files = AtomicU64::new(0);
     let bytes = AtomicU64::new(0);
