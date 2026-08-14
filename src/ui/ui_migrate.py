@@ -937,10 +937,16 @@ class MigrateHandler:
         """通用：将 dev_env_configured 中匹配 src_path 的工具 target_path 更新为新路径
 
         用于：改迁、重建链接、修复链接后，让开发环境区知道数据的新位置。
+        包裹语义：实际数据位置 = 新目标 + 源文件夹名；
+        工具路径 = 实际数据位置 + 相对子路径（工具路径是源路径子目录时）。
         """
         from dev_env_migrate import (TOOLS as DEV_TOOLS, get_tool_default_c_path as dev_get_default_c)
         dev_env_cfg = self.cfg.get("dev_env_configured", {})
         norm_src = src_path.replace("\\\\?\\", "").replace("/", "\\").lower().rstrip("\\")
+        # 源文件夹名（原始大小写，包裹层用；套娃源照搬完整段）
+        _src_orig = src_path.replace("\\\\?\\", "").replace("/", "\\").rstrip("\\")
+        from migrator import _get_source_wrap_name
+        _src_name = _get_source_wrap_name(_src_orig)
         updated = []
         for tool in DEV_TOOLS:
             if tool.get("special"):
@@ -953,9 +959,19 @@ class MigrateHandler:
                 if norm_src == norm_tool or norm_tool.startswith(norm_src + "\\"):
                     cfg_info = dev_env_cfg.get(tool["id"], {})
                     if cfg_info and cfg_info.get("target_drive"):
-                        cfg_info["target_path"] = new_target_path
+                        # 包裹语义：工具实际位置 = 新目标\源文件夹名 + 相对子路径
+                        if norm_src == norm_tool:
+                            cfg_info["target_path"] = os.path.join(new_target_path, _src_name)
+                        else:
+                            rel = tool_c_path[len(norm_src):].lstrip("\\")
+                            if rel:
+                                cfg_info["target_path"] = os.path.join(
+                                    new_target_path, _src_name, rel)
+                            else:
+                                cfg_info["target_path"] = os.path.join(
+                                    new_target_path, _src_name)
                         updated.append(tool["name"])
-                        log.info(f"更新开发环境配置 target_path: {tool['name']} → {new_target_path}")
+                        log.info(f"更新开发环境配置 target_path: {tool['name']} → {cfg_info['target_path']}")
             except Exception as e:
                 log.debug("忽略异常: %s", e)
         if updated:
@@ -1393,43 +1409,56 @@ class MigrateHandler:
         # 规范化路径：QFileDialog 在部分 Windows 版本返回正斜杠，转为反斜杠
         new_base = os.path.normpath(new_base)
 
-        # 构建新目标路径：目标目录/src目录名
-        src_name = os.path.basename(src_path.rstrip("\\/"))
-        new_dst = os.path.join(new_base, src_name)
+        # 目标 = 用户选的容器目录；migrate_symlink 内部包裹
+        # （数据放入 容器\源文件夹名）
+        # 历史代码在此预拼接源名，与 migrate_symlink 的包裹叠加导致双重嵌套
+        # （H:\...\glm-pc-updater\glm-pc-updater），实测断链事故 2026-08-13
+        new_dst = new_base
+        # 源文件夹名：套娃源照搬完整段（与 migrator.migrate 一致）
+        from migrator import _get_source_wrap_name
+        src_name = _get_source_wrap_name(src_path)
+        # 实际数据位置 = 容器\源文件夹名（用于比较/显示/记录，与 migrate_symlink 包裹一致）
+        _real_dst = os.path.join(new_dst, src_name) if src_name else new_dst
 
         # 如果新目标和旧目标相同，无需改迁
-        if os.path.normpath(new_dst).lower() == os.path.normpath(real_target).lower():
+        if os.path.normpath(_real_dst).lower() == os.path.normpath(real_target).lower():
             QMessageBox.information(self, "无需改迁",
-                f"新目标路径与当前真实数据路径相同：\n{new_dst}")
+                f"新目标路径与当前真实数据路径相同：\n{_real_dst}")
             return
 
-        # 如果新目标已存在且不是符号链接，需要确认覆盖
-        if os.path.exists(new_dst):
-            if is_symlink(new_dst):
+        # 实际数据位置（容器\源文件夹名）已存在且非空才需要确认覆盖
+        # 空目录不弹确认（复制引擎可直接写入；与 migrate() 内部非空检查行为一致）
+        if os.path.exists(_real_dst):
+            if is_symlink(_real_dst):
                 QMessageBox.critical(self, "目标路径冲突",
-                    f"目标路径已存在符号链接：\n{new_dst}\n\n"
+                    f"目标路径已存在符号链接：\n{_real_dst}\n\n"
                     f"请先手动删除该符号链接或选择其他目录。")
                 return
-            ret = QMessageBox.question(self, "目标路径已存在",
-                f"目标路径已存在：\n{new_dst}\n\n"
-                f"镜像同步会合并覆盖同名文件。\n确定继续？",
-                QMessageBox.Yes | QMessageBox.No)
-            if ret != QMessageBox.Yes:
-                return
+            try:
+                _has_content = os.path.isdir(_real_dst) and bool(os.listdir(_real_dst))
+            except OSError:
+                _has_content = True  # 读取失败时保守确认（不静默覆盖）
+            if _has_content:
+                ret = QMessageBox.question(self, "目标路径已存在",
+                    f"目标路径已存在：\n{_real_dst}\n\n"
+                    f"镜像同步会合并覆盖同名文件。\n确定继续？",
+                    QMessageBox.Yes | QMessageBox.No)
+                if ret != QMessageBox.Yes:
+                    return
 
         # 最终确认
         ret = QMessageBox.question(self, "确认改迁",
             f"将改迁以下目录到新位置：\n\n"
             f"C 盘链接: {src_path}\n"
             f"当前数据: {real_target}\n"
-            f"新 目 标: {new_dst}\n\n"
+            f"新 目 标: {_real_dst}\n\n"
             f"将执行：复制数据 → 更新C盘链接 → 删除旧数据目录\n"
             f"后台执行，请稍候...\n\n确定？",
             QMessageBox.Yes | QMessageBox.No)
         if ret != QMessageBox.Yes:
             return
 
-        self.status_label.setText(f"正在改迁: {src_path} → {new_dst}（后台执行）...")
+        self.status_label.setText(f"正在改迁: {src_path} → {_real_dst}（后台执行）...")
 
         class _RelocateWorker(QThread):
             done_signal = Signal(bool, str, str)  # (ok, msg, src_path)
@@ -1525,7 +1554,7 @@ class MigrateHandler:
                 except Exception as e:
                     log.error(f"改迁后清理符号链接残留失败: {e}")
                 QMessageBox.information(self, "改迁成功", msg)
-                # 更新已迁移表中该行的 dst
+                # 更新已迁移表中该行的 dst（显示实际数据位置 = 容器\源文件夹名）
                 for r in range(self.table_migrated.rowCount()):
                     if (self.table_migrated.item(r, 0) and
                             self.table_migrated.item(r, 0).text() == path):
@@ -1533,11 +1562,11 @@ class MigrateHandler:
                         from ui_widgets import NumericTableWidgetItem, _format_size, _apply_size_item_color
                         dst_item = self.table_migrated.item(r, 1)
                         if dst_item:
-                            dst_item.setText(new_dst)
-                            dst_item.setToolTip(new_dst)
+                            dst_item.setText(_real_dst)
+                            dst_item.setToolTip(_real_dst)
                         # 更新 size 列
                         try:
-                            new_size = get_dir_size_fast(new_dst) if os.path.exists(new_dst) else 0
+                            new_size = get_dir_size_fast(_real_dst) if os.path.exists(_real_dst) else 0
                         except Exception:
                             new_size = 0
                         size_item = self.table_migrated.item(r, 2)
@@ -1545,10 +1574,10 @@ class MigrateHandler:
                             size_item.setText(_format_size(new_size))
                             size_item.setData(Qt.UserRole, float(new_size))
                             _apply_size_item_color(size_item, new_size)
-                        # 更新 config 记录
+                        # 更新 config 记录（包裹语义：实际数据位置 = 容器\源文件夹名）
                         for m in self.cfg.get("migrated", []):
                             if m.get("src") == path:
-                                m["dst"] = new_dst
+                                m["dst"] = _real_dst
                                 m["size_mb"] = new_size
                                 m["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 break
@@ -1556,7 +1585,7 @@ class MigrateHandler:
                         break
                 # 刷新已迁移表状态（更新链接目标列 + 大小 + 状态）
                 self._update_migrated_rows_status([r])
-                self.status_label.setText(f"改迁成功: {path} → {new_dst}")
+                self.status_label.setText(f"改迁成功: {path} → {_real_dst}")
             else:
                 self._log_monitor("error", f"改迁失败: {path} - 原因: {msg}")
                 QMessageBox.critical(self, "改迁失败", msg)

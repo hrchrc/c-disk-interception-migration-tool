@@ -556,16 +556,17 @@ class MonitorLogHandler:
             log.debug("忽略异常: %s", e)
 
     def _refresh_log_only(self):
-        """刷新监控日志 - 从 监控日志.log 文件读取最近1000条到cache，再渲染"""
+        """刷新监控日志 - 从 监控日志.log + app.log 读取最近日志到cache，再渲染
+
+        修复（2026-08-14）：applog 类型（应用日志）只存在内存 cache 不落盘，
+        原刷新用文件内容覆盖 cache 导致应用日志丢失且无法恢复；
+        现合并 app.log 最近日志、重置增量读取位置，并记录刷新动作本身。
+        """
         try:
-            if not MONITOR_LOG_FILE.exists():
-                self._monitor_log_cache = []
-                self._render_monitor_log()
-                self.log_text.append('<span style="color:#757575">暂无监控日志</span>')
-                self.status_label.setText("暂无监控日志")
-                return
-            with open(MONITOR_LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-1000:]  # 最多读取1000条
+            lines = []
+            if MONITOR_LOG_FILE.exists():
+                with open(MONITOR_LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()[-1000:]  # 最多读取1000条
             import re
             # 匹配 [时间] [事件类型] 消息
             # event_type 用通用 [a-zA-Z_]+ 匹配，避免新增类型时漏改正则导致 unknown
@@ -577,15 +578,56 @@ class MonitorLogHandler:
                     continue
                 m = line_re.match(line)
                 if m:
-                    ts_str = m.group(1)
-                    etype = m.group(2)
-                    msg = m.group(3)
-                    cache.append((ts_str, etype, msg))
+                    cache.append((m.group(1), m.group(2), m.group(3)))
                 else:
-                    cache.append(( "", "unknown", line))
-            self._monitor_log_cache = cache[-1000:]  # 确保不超过1000条
+                    cache.append(("", "unknown", line))
+            # 合并 app.log 最近日志（applog 类型，刷新后重新加载不丢失应用日志）
+            app_cache = []
+            if LOG_FILE.exists():
+                try:
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        app_lines = f.readlines()[-300:]
+                    for line in app_lines:
+                        line = line.rstrip("\n")
+                        if not line.strip():
+                            continue
+                        # app.log 格式：2026-07-16 08:11:08,142 [INFO] 消息
+                        m2 = re.match(
+                            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] (.*)$",
+                            line)
+                        if m2 and m2.group(2) != "DEBUG":
+                            app_cache.append((m2.group(1), "applog",
+                                              f"[{m2.group(2)}] {m2.group(3)}"))
+                        elif not m2:
+                            app_cache.append(
+                                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 "applog", line))
+                except Exception as e:
+                    log.debug("忽略异常: %s", e)
+            cache = (cache + app_cache)[-1000:]
+            # 重置 applog 增量读取位置到 app.log 末尾，
+            # 避免 _tail_app_log 重复追加刷新已显示过的行
+            try:
+                if LOG_FILE.exists():
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        f.seek(0, 2)
+                        self._applog_pos = f.tell()
+            except Exception:
+                pass
+            self._monitor_log_cache = cache
             self._render_monitor_log()
-            self.status_label.setText(f"监控日志已刷新（{len(self._monitor_log_cache)}条）")
+            # 记录刷新动作本身（写监控日志文件 + 追加 cache）
+            try:
+                full_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                safe_msg = f"已手动刷新监控日志（共 {len(cache)} 条）"
+                with open(MONITOR_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"[{full_ts}] [init] {safe_msg}\n")
+                from config import rotate_log_if_needed
+                rotate_log_if_needed(MONITOR_LOG_FILE)
+                self._monitor_log_cache.append((full_ts, "init", safe_msg))
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
+            self.status_label.setText(f"监控日志已刷新（{len(cache)}条）")
         except Exception as e:
             self.status_label.setText(f"刷新日志失败: {e}")
             log_error_with_reason("未知错误", str(e), "_refresh_log_only")

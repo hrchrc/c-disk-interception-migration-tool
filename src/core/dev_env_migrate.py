@@ -2562,6 +2562,62 @@ def get_suggest_path(tool, target_drive):
     return special_paths.get(tool["id"], "")
 
 
+def _registry_env_exists(name):
+    """环境变量是否存在于用户或系统注册表（HKCU 优先，HKLM 兜底）
+
+    :return: True=注册表有该变量（真实配置）；False=注册表无（可能是残留）
+    """
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            key = winreg.OpenKey(root, "Environment")
+            try:
+                winreg.QueryValueEx(key, name)
+                return True
+            except FileNotFoundError:
+                pass
+            finally:
+                winreg.CloseKey(key)
+        except FileNotFoundError:
+            continue  # HKLM\Environment 不存在（部分系统无此键）
+        except Exception:
+            return True  # 注册表读取失败：保守返回 True（不清除，避免误删系统配置）
+    return False
+
+
+def clean_env_var_residues():
+    """启动自愈：清除软件管理的工具环境变量残留
+
+    实测事故（2026-08-13）：配置时 set_user_env_var 把值同步写入了当时进程的
+    os.environ（dev_env_migrate.py set_user_env_var），注册表随后被外部清理，
+    从旧进程链启动的软件继承残留，导致检测显示旧路径（如 H:\\ceshi软件）。
+
+    判断：进程 os.environ 有值，但注册表（HKCU + HKLM）均无该变量
+    → 视为残留，从当前进程环境清除，让检测回落到默认路径。
+
+    安全边界：
+    - 只处理本软件管理的工具变量名（TOOLS 的 env_vars，34 个），不碰其他变量
+    - 注册表有值则不动（用户/软件的真实配置）
+    - 只改当前进程 os.environ（内存），不改注册表、不影响其他进程
+    :return: 被清除的变量名列表
+    """
+    managed = set()
+    for tool in TOOLS:
+        for ev in tool.get("env_vars", []):
+            managed.add(ev["name"])
+    cleaned = []
+    for name in managed:
+        if name not in os.environ:
+            continue
+        if _registry_env_exists(name):
+            continue  # 注册表有值：真实配置，不碰
+        # 注册表无值但进程有 → 残留，清除
+        os.environ.pop(name, None)
+        cleaned.append(name)
+    if cleaned:
+        _log.info(f"启动自愈：清除 {len(cleaned)} 个环境变量残留: {cleaned}")
+    return cleaned
+
+
 def remove_user_env_var(name):
     """删除用户级环境变量
     :return: (成功?, 错误信息)
@@ -2732,7 +2788,8 @@ def get_tool_data_info(tool):
 
 
 def migrate_tool_data(tool, target_drive, config=None, source_path_override=None,
-                       target_path_override=None, log_callback=None):
+                       target_path_override=None, log_callback=None,
+                       force_overwrite=False, merge=False):
     """迁移工具数据到目标路径（通用：支持 C→D / D→D / D→E / E→F 等任意盘间迁移）
 
     通用迁移逻辑：
@@ -2751,6 +2808,8 @@ def migrate_tool_data(tool, target_drive, config=None, source_path_override=None
     :param source_path_override: 外部传入的源路径（在 apply_tool 改环境变量前捕获）
     :param target_path_override: 外部传入的目标路径（用户在表格中修改过的路径）
     :param log_callback: 日志回调
+    :param force_overwrite: True=跳过目标非空检测（配合 merge 使用，开发环境区覆盖确认后）
+    :param merge: True=合并复制（目标中源没有的文件保留，不 purge；同名覆盖）
     :return: (成功?, 消息, 迁移记录 dict or None)
     """
     # 清空 detect/path 缓存（迁移后源位置变符号链接，下次刷新需重新检测）
@@ -2784,11 +2843,7 @@ def migrate_tool_data(tool, target_drive, config=None, source_path_override=None
     except Exception as e:
         _log.debug("忽略异常: %s", e)
 
-    # 检查源路径是否存在
-    if not os.path.exists(source_path):
-        return True, f"源路径不存在（{source_path}），无数据可迁移", None
-
-    # ===== 2. 确定目标路径 =====
+    # ===== 2. 确定目标路径（提前到源==目标比较之前）=====
     if target_path_override:
         target_path = target_path_override.replace("\\\\?\\", "")
     else:
@@ -2802,9 +2857,19 @@ def migrate_tool_data(tool, target_drive, config=None, source_path_override=None
     if target_path.startswith("\\\\?\\"):
         target_path = target_path[4:]
 
-    # ===== 3. 如果源路径和目标路径相同，跳过 =====
+    # ===== 2.5 源==目标检查（先于源存在检查，防"无数据可迁移"假成功）=====
+    # 源==目标说明环境变量已指向目标路径（可能是残留或重复配置），
+    # 提示另选新路径，而非静默"无需迁移"成功
+    # （避免数据未迁移的假成功：环境变量指向目标但 C 盘真实数据没搬过去）
     if os.path.normpath(source_path).lower() == os.path.normpath(target_path).lower():
-        return True, "源路径和目标路径相同，无需迁移", None
+        return False, ("当前路径已是目标路径，请另外选择一个新的目标路径：\n"
+                       f"  {source_path}\n"
+                       f"（环境变量可能已指向该路径；若数据确已在目标位置，"
+                       f"请先撤销配置再重新配置，或直接使用该路径无需迁移）"), None
+
+    # 检查源路径是否存在
+    if not os.path.exists(source_path):
+        return True, f"源路径不存在（{source_path}），无数据可迁移", None
 
     # ===== 4. 复用 Migrator.migrate() =====
     # Migrator.migrate 内部：robocopy /MIR 复制 + 删源 + mklink + 记录 migrated
@@ -2816,7 +2881,8 @@ def migrate_tool_data(tool, target_drive, config=None, source_path_override=None
         # 接收外部 log_callback（开发工具迁移区专用，普通调用为 None）
         if log_callback is not None:
             migrator.log_callback = log_callback
-        ok, msg = migrator.migrate(source_path, target_path)
+        ok, msg = migrator.migrate(source_path, target_path,
+                                   force_overwrite=force_overwrite, merge=merge)
         # 从 config["migrated"] 中查找刚写入的记录
         record = None
         if ok:

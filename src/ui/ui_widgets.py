@@ -7,12 +7,43 @@
 - WideEditorDelegate：说明列宽编辑委托
 - _format_size / _apply_size_item_color：大小格式化辅助函数
 - NotifyBubble / show_notify_bubble：右下角悬浮提醒气泡
+- OneLineLabel：状态栏单行标签（长文本截断，原文进 tooltip，防状态栏被撑高）
 """
 from PySide6.QtWidgets import (QTableWidgetItem, QStyledItemDelegate, QLineEdit,
                                QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
                                QHBoxLayout, QApplication)
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation
 from PySide6.QtGui import QColor
+
+
+class OneLineLabel(QLabel):
+    """状态栏单行标签：防长错误消息撑高状态栏
+
+    任何 setText 的文本都会：
+    1. 换行符转为空格（多行错误消息压成一行）
+    2. 超 150 字符截断并加 "..."（状态栏不随文本变宽/变高）
+    3. 完整原文存入 tooltip（鼠标悬浮可看全文）
+
+    用法：创建处把 QLabel 换成 OneLineLabel 即可，所有 setText 调用点自动受保护。
+    """
+    MAX_LEN = 150
+
+    def setText(self, text):
+        try:
+            full = "" if text is None else str(text)
+            one_line = full.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+            if len(one_line) > self.MAX_LEN:
+                shown = one_line[:self.MAX_LEN - 3] + "..."
+            else:
+                shown = one_line
+            super().setText(shown)
+            if full and full != shown:
+                self.setToolTip(full)
+            else:
+                self.setToolTip("")
+        except Exception:
+            # 兜底：任何异常都退回原生 setText，绝不因此崩溃
+            super().setText("" if text is None else str(text))
 
 
 class NumericTableWidgetItem(QTableWidgetItem):

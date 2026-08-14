@@ -289,7 +289,7 @@ _FORBIDDEN_RD_PATHS = frozenset([
     r"C:\USERS", r"C:\RECOVERY", r"C:\SYSTEM VOLUME INFORMATION",
 ])
 # C:\WINDOWS 整棵子树(SYSTEM32 等)也拒绝;其余关键路径只精确拒绝本身,
-# 不误伤其子目录(C:\Users\aaa\... 是正常迁移范围)。
+# 不误伤其子目录(C:\Users\xxx\... 是正常迁移范围)。
 _FORBIDDEN_RD_PREFIXES = (r"C:\WINDOWS",)
 
 # Restart Manager (rstrtmgr.dll) 句柄模块级缓存(P6 审查修复):
@@ -314,6 +314,29 @@ def _get_rm_dll():
             if _RM_DLL is None:
                 _RM_DLL = ctypes.WinDLL("rstrtmgr.dll")
     return _RM_DLL
+
+
+def _get_source_wrap_name(src_path):
+    """提取"包裹用源文件夹名"：源路径存在连续同名段（套娃，如 C:\\dev\\dve\\dve）
+    时照搬完整段（dve\\dve），否则取最后一层名（如 Sdk）。
+
+    套娃源照搬（2026-08-14）：源目录本身连续同名段（一层套一层）时迁移照搬完整结构，
+    不能只取最后一层导致目标少一层。
+    例：
+      C:\\Users\\...\\Android\\Sdk      → "Sdk"（正常）
+      C:\\dev\\dve\\dve               → "dve\\dve"（套娃照搬）
+      D:\\dev\\android\\sdk\\Sdk      → "sdk\\Sdk"（大小写不同的同名也算套娃，
+                                         Windows 大小写不敏感）
+    """
+    parts = [p for p in str(src_path).replace("/", "\\").rstrip("\\").split("\\") if p]
+    if not parts:
+        return ""
+    name = parts[-1]
+    i = len(parts) - 2
+    while i >= 0 and parts[i].lower() == name.lower():
+        name = parts[i] + "\\" + name
+        i -= 1
+    return name
 
 
 def _validate_migration_paths(src_path, dst_path):
@@ -1371,7 +1394,7 @@ class Migrator:
             rm.RmEndSession(session)
 
     def _run_copy_with_progress(self, src, dst, action_label="迁移",
-                                verify="hash"):
+                                verify="hash", merge=False):
         """统一复制入口,P4 起默认走 Rust 引擎(ADR-003)。
 
         P7 起硬编码走引擎(ADR-003 完全取代,不留切换后门)。
@@ -1387,6 +1410,8 @@ class Migrator:
         :param dst: 目标目录
         :param action_label: "迁移"/"改迁"/"续传"/"还原"(仅用于日志文案)
         :param verify: "hash"(默认,P5 强制)/"none"(显式关闭)
+        :param merge: True=合并复制(引擎 copy 模式,不 purge 目标多余文件,
+            目标中原有文件保留,同名文件覆盖);False=镜像(mirror+purge,默认)
         :return: 兼容复制引擎语义的返回码
         """
         # P6:复制前 Restart Manager 占用检测——避免复制到一半因文件占用失败。
@@ -1405,6 +1430,11 @@ class Migrator:
                 "startup_failed": False,
             }
             return 16
+        if merge:
+            # 合并复制：引擎 copy 模式（不 purge），目标中原有文件保留
+            return self._run_engine_with_progress(src, dst, action_label,
+                                                  mode="copy", purge_enabled=False,
+                                                  verify=verify)
         return self._run_engine_with_progress(src, dst, action_label,
                                               verify=verify)
 
@@ -1547,18 +1577,27 @@ class Migrator:
         except Exception:
             return False, ""
 
-    def migrate(self, src_path, dst_path=None, kill_process=None, force_overwrite=False):
+    def migrate(self, src_path, dst_path=None, kill_process=None, force_overwrite=False,
+                merge=False):
         """迁移源目录到目标盘（事务性，支持断电恢复）
 
         ⚠️ 此操作会删除源目录的真实数据（清空源目录），并在原位置创建符号链接指向目标。
         源目录清空后由符号链接替代，软件通过原路径访问时自动跳转到目标盘，无感知。
+
+        :param merge: True=合并复制（引擎 copy 模式，目标中源没有的文件保留，
+            不 purge；同名文件覆盖）。开发环境区覆盖确认后使用；默认 False=镜像。
+
+        包裹语义（2026-08-13 起）：迁移 = 把源文件夹**整体**（保留文件夹名）
+        放入目标目录 —— 实际数据位置 = dst_path\\源文件夹名（dst_full）。
+        源路径变为符号链接指向 dst_full。目标目录根原有的文件与迁移数据
+        天然隔离，不再出现同名覆盖（此前"内容铺进目标根"会导致覆盖事故）。
 
         流程：
         1. 写入 pending 事务记录到 config.json（标记开始）
         2. 复制引擎镜像复制（幂等重跑，断电续传）
         3. 文件数完整性验证
         4. 删除源目录（rd /s /q 优先，最快）—— 源目录会被清空删除
-        5. 创建符号链接（源路径 → 目标路径）
+        5. 创建符号链接（源路径 → dst_full）
         6. 从 pending 移除，加入 completed 记录
         6.5 链式修复：若 src 是某条旧记录的 dst（用户对已迁移目录再次换路径），
             自动更新旧记录的 dst 并重建旧 src 链接直指新目标，消除套娃
@@ -1580,7 +1619,8 @@ class Migrator:
             if not dst_path:
                 return True, f"已经是符号链接且未指定新目标: {src_path}"
             self._emit_log("migrate", f"  🔗 检测到符号链接，自动转改迁模式: {src.name}")
-            return self.migrate_symlink(src_path, dst_path, force_overwrite=force_overwrite)
+            return self.migrate_symlink(src_path, dst_path, force_overwrite=force_overwrite,
+                                        merge=merge)
         # 明确拒绝文件源：本工具只支持迁移文件夹（文件无法用目录链接重定向）。
         # 此前文件源会走到引擎 walk 失败(ERROR_DIRECTORY)，用户只看到通用"复制失败"。
         # 拒绝发生在事务写入前，不产生 pending、不触碰源文件。
@@ -1589,16 +1629,33 @@ class Migrator:
             return False, (f"仅支持迁移文件夹，暂不支持迁移单个文件：\n  {src_path}\n"
                            f"如需迁移单个文件，请先将其放入一个文件夹后迁移该文件夹。")
         if not dst_path:
-            dst_path = str(Path(self.cfg["g_root"]) / src.name / "appdata")
+            # 默认目标：默认盘根目录。包裹语义下数据 = g_root\源文件夹名
+            # （旧逻辑 g_root\源名\appdata 会导致包裹后嵌套两层：g_root\源名\appdata\源名）
+            dst_path = str(Path(self.cfg["g_root"]))
         dst = Path(dst_path)
+        # 包裹语义：实际数据位置 = 目标目录 + 源文件夹名
+        # 源文件夹名：源路径本身套娃（连续同名段，如 C:\dev\dve\dve）时照搬完整段
+        # 防套娃（2026-08-14）：目标路径的文件夹名与源文件夹名相同
+        # （忽略大小写）时，目标本身就是数据位置，不再包裹——
+        # 如默认建议路径 D:\dev\android\sdk + 源 Sdk → 数据直接放 D:\dev\android\sdk，
+        # 而非 D:\dev\android\sdk\Sdk；通用容器目标（如 H:\...）仍包裹为 H:\...\Sdk
+        _src_name = _get_source_wrap_name(str(src))
+        _dst_base = os.path.basename(dst_path.rstrip("\\/"))
+        if _dst_base and _dst_base.lower() == _src_name.lower():
+            dst_full = dst_path
+        else:
+            dst_full = os.path.join(dst_path, _src_name)
+        dst_data = Path(dst_full)
+        log.info(f"包裹迁移: {src_path} -> {dst_full}（源文件夹整体放入目标）")
 
         # ===== 步骤0.1：src/dst 路径校验（防止镜像同步数据安全事故）=====
         # 修复 N2：原代码 src==dst 时跳过包含校验，复制引擎虽会报错但用户看到模糊错误
         # 现改为显式拒绝，给出清晰提示（判定逻辑提取为 _validate_migration_paths）
-        _ok, _err = _validate_migration_paths(src_path, dst_path)
+        # 校验用实际数据位置 dst_full（数据最终落在那里，删除源时必须不在其中）
+        _ok, _err = _validate_migration_paths(src_path, dst_full)
         if not _ok:
             log_error_with_reason("迁移路径校验失败",
-                f"src={src_path}, dst={dst_path}", "路径校验拒绝迁移")
+                f"src={src_path}, dst={dst_full}", "路径校验拒绝迁移")
             return False, _err
 
         if kill_process:
@@ -1606,51 +1663,74 @@ class Migrator:
                            capture_output=True, creationflags=_NO_WINDOW_FLAGS)
 
         # 检查目标盘是否存在（防止 U 盘被拔、盘符错误等情况导致 mkdir 崩溃）
-        if dst.is_absolute():
-            dst_root = dst.anchor  # e.g. "D:\\"
+        if dst_data.is_absolute():
+            dst_root = dst_data.anchor  # e.g. "D:\\"
             if not os.path.exists(dst_root):
-                log_error_with_reason("目标盘不存在", context=f"迁移: {src_path} -> {dst_path}")
+                log_error_with_reason("目标盘不存在", context=f"迁移: {src_path} -> {dst_full}")
                 return False, f"目标盘不存在: {dst_root}（请检查目标盘是否已连接）"
 
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst_data.parent.mkdir(parents=True, exist_ok=True)
         except (OSError, FileNotFoundError) as e:
             log_error_with_reason("目标目录创建失败",
-                f"无法创建目录: {e}", f"迁移: {src_path} -> {dst_path}")
-            return False, f"目标目录创建失败: {dst.parent}\n错误: {e}"
+                f"无法创建目录: {e}", f"迁移: {src_path} -> {dst_full}")
+            return False, f"目标目录创建失败: {dst_data.parent}\n错误: {e}"
 
         # ===== 步骤0：清理目标路径的残留符号链接 =====
         # 如果目标路径是符号链接（包括断链），复制引擎会跟着链接走
         # 导致数据写错位置或产生链式链接，必须先删除符号链接（只删链接不删数据）
         # 注意：os.path.exists 对断链符号链接返回 False，所以用 is_symlink 判断
-        if is_symlink(dst_path):
-            try:
-                os.rmdir(dst_path)
-                log.info(f"迁移: 删除目标路径残留符号链接: {dst_path}")
-                self._emit_log("migrate", f"  🔗 已清理目标路径残留符号链接: {os.path.basename(dst_path)}")
-            except Exception as e:
-                # 删除失败必须中止，否则 复制引擎会跟着符号链接走，产生链式链接
-                log_error_with_reason("目标路径符号链接清理失败",
-                    f"无法删除符号链接: {e}", f"迁移: {src_path} -> {dst_path}")
-                return False, (f"目标路径已存在符号链接但无法删除: {dst_path}\n"
-                              f"错误: {e}\n"
-                              f"请手动删除该符号链接后重试。")
+        # 包裹语义下：数据落在 dst_full（dst_path\源名），两个位置都可能残留链接
+        for _check_link in (dst_path, dst_full):
+            if is_symlink(_check_link):
+                try:
+                    os.rmdir(_check_link)
+                    log.info(f"迁移: 删除目标路径残留符号链接: {_check_link}")
+                    self._emit_log("migrate",
+                        f"  🔗 已清理目标路径残留符号链接: {os.path.basename(_check_link)}")
+                except Exception as e:
+                    # 删除失败必须中止，否则 复制引擎会跟着符号链接走，产生链式链接
+                    log_error_with_reason("目标路径符号链接清理失败",
+                        f"无法删除符号链接: {e}", f"迁移: {src_path} -> {_check_link}")
+                    return False, (f"目标路径已存在符号链接但无法删除: {_check_link}\n"
+                                  f"错误: {e}\n"
+                                  f"请手动删除该符号链接后重试。")
 
         # ===== 步骤0.5：目标非空警告（防止误删用户文件）=====
         # 复制引擎（镜像模式）会删除目标中源没有的文件，如果用户在目标目录放了文件会被误删
         # 调用方传 force_overwrite=True 可跳过此检测
+        # 包裹语义下检查实际数据位置 dst_full（目标根原有文件不受影响）
         if not force_overwrite:
-            is_nonempty, warning = self._check_dst_nonempty(dst_path, src_path)
+            is_nonempty, warning = self._check_dst_nonempty(dst_full, src_path)
             if is_nonempty:
                 return False, f"NEED_CONFIRM_OVERWRITE\n{warning}"
+
+        # ===== 步骤0.6：源目录为空检查（防止"空迁移假成功"）=====
+        # 实测事故（2026-08-13）：环境变量残留指向已清空的目录（如链式修复后保留的
+        # 空目录），引擎复制 0 文件仍返回 rc=0"成功"，用户以为数据迁移了实际没有。
+        # 空目录迁移本身无意义，直接拒绝并提示，杜绝假成功。
+        try:
+            src_file_count = self._count_files_fast(src)
+            if src_file_count == 0:
+                log_error_with_reason("源目录为空",
+                    f"src={src_path}", "拒绝迁移空目录")
+                self._emit_log("warn",
+                    f"  ⚠️ 源目录为空（0 个文件），拒绝迁移: {src.name}")
+                return False, (f"源目录为空（0 个文件），已拒绝迁移：{src_path}\n"
+                              f"数据可能在其他位置（如环境变量残留指向已清空的目录，"
+                              f"或符号链接指向的真实数据目录），\n"
+                              f"请确认源路径正确后再迁移。")
+        except Exception as e:
+            # 统计失败时保守放行（不能因统计异常阻断正常迁移）
+            log.warning(f"源文件数统计失败（放行）: {e}")
 
         # ===== 步骤0.8：磁盘空间预检查（避免 复制引擎写到一半空间不足卡住）=====
         try:
             # 使用 lstat 而非 stat，避免跟随符号链接导致重复计算或循环
             # 排除符号链接文件，防止嵌套链接造成空间计算虚高
             src_size = self._real_size_bytes_fast(src)  # #25:MFT 优先,跨盘回退
-            if dst.is_absolute():
-                dst_drive = dst.anchor
+            if dst_data.is_absolute():
+                dst_drive = dst_data.anchor
                 dst_usage = shutil.disk_usage(dst_drive)
                 src_mb = src_size // 1024 // 1024
                 free_mb = dst_usage.free // 1024 // 1024
@@ -1685,17 +1765,19 @@ class Migrator:
         pending[:] = [p for p in pending if p.get("src") != src_path]
         pending.append({
             "src": str(src),
-            "dst": str(dst),
+            "dst": str(dst_data),  # 包裹语义：记录实际数据位置（dst_path\源名）
             "stage": "started",
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # merge 标志：断电恢复续传时保持合并复制语义（不 purge 目标多余文件）
+            "merge": merge,
         })
         save_all(self.cfg)
-        self._emit_log("migrate", f"📤 开始迁移: {src.name} | {src} → {dst}")
+        self._emit_log("migrate", f"📤 开始迁移: {src.name} | {src} → {dst_data}")
 
         # ===== 步骤2：复制引擎复制数据（/MIR 幂等，可断电续传）=====
-        log.info(f"复制引擎: {src} -> {dst}")
+        log.info(f"复制引擎: {src} -> {dst_full}")
         self._emit_log("migrate", f"  ⏳ 正在复制数据（镜像模式）: {src.name}...")
-        rc = self._run_copy_with_progress(src, dst, action_label="迁移")
+        rc = self._run_copy_with_progress(src, dst_full, action_label="迁移", merge=merge)
         if rc >= 8 or rc == _CANCELLED_RC:
             short_log, long_msg = self._format_copy_fail(rc, src_path, "迁移")
             log_error_with_reason("复制失败",
@@ -1729,7 +1811,7 @@ class Migrator:
         # ===== 步骤3：文件数完整性验证 =====
         try:
             src_file_count = self._count_files_fast(src)
-            dst_file_count = self._count_files_fast(dst)
+            dst_file_count = self._count_files_fast(dst_data)
             self._emit_log("migrate",
                 f"  🔍 文件数验证: C盘 {src_file_count} 个 / 目标盘 {dst_file_count} 个 ({src.name})")
             if src_file_count > 0 and dst_file_count < src_file_count:
@@ -1775,7 +1857,7 @@ class Migrator:
                     p["stage"] = "rustcopy_done"
                     p["error"] = "用户取消（删源前），目标盘数据已完整"
             save_all(self.cfg)
-            return False, f"迁移已取消（删源前），目标盘数据已完整: {dst}\n下次启动会自动续传（仅剩删源+建链接）。"
+            return False, f"迁移已取消（删源前），目标盘数据已完整: {dst_data}\n下次启动会自动续传（仅剩删源+建链接）。"
         self._emit_log("migrate", f"  🗑 正在处理源目录: {src.name}...")
         src_deleted = False
         delete_errors = []
@@ -1844,7 +1926,7 @@ class Migrator:
             save_all(self.cfg)
             return False, (f"删除C盘源目录失败（可能文件被占用）。\n"
                           f"错误详情: {err_detail}\n"
-                          f"目标盘已有完整数据: {dst}\n"
+                          f"目标盘已有完整数据: {dst_data}\n"
                           f"⚠️ 已记录未完成事务，请关闭占用程序后重启程序，会自动重试删除并创建链接。")
 
         # 更新 stage
@@ -1855,8 +1937,8 @@ class Migrator:
         self._emit_log("migrate", f"  ✓ C 盘源目录已删除: {src.name}")
 
         # ===== 步骤5：创建链接（符号链接 /D 优先，Junction 兜底）=====
-        self._emit_log("migrate", f"  🔗 正在创建链接: {src.name} → {dst}")
-        mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst))
+        self._emit_log("migrate", f"  🔗 正在创建链接: {src.name} → {dst_data}")
+        mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst_data))
         if not mklink_ok:
             log_error_with_reason("创建链接失败",
                 mklink_err, f"迁移: {src_path} -> {dst_path}")
@@ -1868,11 +1950,11 @@ class Migrator:
             save_all(self.cfg)
             # C 盘已删除但链接未创建，下次启动会自动重试
             return False, (f"创建链接失败（{mklink_err}）。\n"
-                          f"⚠️ C 盘目录已删除，数据完整在 D 盘: {dst}\n"
+                          f"⚠️ C 盘目录已删除，数据完整在目标盘: {dst_data}\n"
                           f"已记录未完成事务，下次启动程序会自动重试创建链接。")
 
         # ===== 步骤6：完成事务，从 pending 移除，加入 completed =====
-        self._add_migrated_record(str(src), str(dst))
+        self._add_migrated_record(str(src), str(dst_data))
         # 从 pending 移除
         pending[:] = [p for p in pending if p.get("src") != src_path]
         save_all(self.cfg)
@@ -1912,16 +1994,16 @@ class Migrator:
                         else:
                             os.unlink(old_src)
                         # 重建为直接指向新 dst 的链接（符号链接 /D 优先）
-                        ok, _ = self._create_dir_link(old_src, str(dst))
+                        ok, _ = self._create_dir_link(old_src, str(dst_data))
                         if not ok:
                             raise Exception("创建链接失败")
                         # 更新 config 记录的 dst 字段为新目标
-                        m["dst"] = str(dst)
+                        m["dst"] = str(dst_data)
                         m["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         chain_fixed += 1
                         self._emit_log("migrate",
-                            f"  🔗 修复链式链接: {os.path.basename(old_src)} → {dst}（原指向 {src_path}）")
-                        log_link_operation("修复链式链接", old_src, str(dst),
+                            f"  🔗 修复链式链接: {os.path.basename(old_src)} → {dst_data}（原指向 {src_path}）")
+                        log_link_operation("修复链式链接", old_src, str(dst_data),
                             f"原指向 {src_path}, 现直指新目标")
                     except Exception as e:
                         chain_fix_failed += 1
@@ -1973,7 +2055,7 @@ class Migrator:
                         ]
                         after = len(self.cfg["migrated"])
                         if before > after:
-                            log.info(f"移除过渡迁移记录: {src_path} → {dst}（已由旧记录接管）")
+                            log.info(f"移除过渡迁移记录: {src_path} → {dst_data}（已由旧记录接管）")
                         save_all(self.cfg)
                         self._emit_log("migrate",
                             f"  ✅ 一对一修复: 过渡软连接已清除（空目录保留）{os.path.basename(src_path)}，"
@@ -1989,18 +2071,19 @@ class Migrator:
             else:
                 if chain_fixed > 0:
                     save_all(self.cfg)
-                log.info(f"修复 {chain_fixed} 个链式符号链接 → {dst}")
+                log.info(f"修复 {chain_fixed} 个链式符号链接 → {dst_data}")
         except Exception as e:
             log.error(f"扫描链式符号链接异常: {e}")
 
-        log.info(f"迁移成功: {src} → {dst}")
-        log_link_operation("创建链接(迁移)", str(src), str(dst), "迁移完成")
+        log.info(f"迁移成功: {src} → {dst_data}")
+        log_link_operation("创建链接(迁移)", str(src), str(dst_data), "迁移完成")
         self._emit_log("migrate",
-            f"  ✅ 迁移完成: {src.name} → {dst}")
+            f"  ✅ 迁移完成: {src.name} → {dst_data}")
         self._maybe_clean_vss()
-        return True, f"迁移成功: {src.name} -> {dst}"
+        return True, f"迁移成功: {src.name} -> {dst_data}"
 
-    def migrate_symlink(self, src_path, dst_path, real_target=None, force_overwrite=False):
+    def migrate_symlink(self, src_path, dst_path, real_target=None, force_overwrite=False,
+                        merge=False):
         """迁移符号链接到新目标（不产生链式链接，事务性，支持断电恢复）
 
         场景：src_path 已经是符号链接（指向 real_target），用户想改迁到 dst_path。
@@ -2027,6 +2110,17 @@ class Migrator:
 
         src = Path(src_path)
         dst = Path(dst_path)
+        # 包裹语义：实际数据位置 = 目标目录 + 源文件夹名（与 migrate() 一致）
+        # 源文件夹名套娃时照搬完整段（_get_source_wrap_name）
+        # 防套娃：目标路径文件夹名与源文件夹名相同（忽略大小写）时不包裹
+        # （如改迁到 D:\glm-pc-updater 且源名 glm-pc-updater → 数据直接放目标）
+        _src_name = _get_source_wrap_name(str(src))
+        _dst_base = os.path.basename(dst_path.rstrip("\\/"))
+        if _dst_base and _dst_base.lower() == _src_name.lower():
+            dst_full = dst_path
+        else:
+            dst_full = os.path.join(dst_path, _src_name)
+        dst_data = Path(dst_full)
 
         # 解析符号链接的真实目标
         if real_target is None:
@@ -2041,14 +2135,14 @@ class Migrator:
 
         real = Path(real_target)
 
-        # 如果 real_target 和 dst_path 相同，无需迁移
-        if os.path.normpath(real_target).lower() == os.path.normpath(str(dst)).lower():
-            return True, f"符号链接已指向目标: {src_path} → {dst_path}"
+        # 如果 real_target 和 dst_full 相同，无需迁移
+        if os.path.normpath(real_target).lower() == os.path.normpath(str(dst_data)).lower():
+            return True, f"符号链接已指向目标: {src_path} → {dst_full}"
 
         # src/dst 包含关系校验（防止 复制引擎（镜像模式）复制到自身内部后清空源导致数据全毁）
         # 用 commonpath 而非 startswith，正确处理盘符根（如 D:\）边界情况
         _norm_real = os.path.normcase(os.path.normpath(str(real)))
-        _norm_dst = os.path.normcase(os.path.normpath(str(dst)))
+        _norm_dst = os.path.normcase(os.path.normpath(str(dst_data)))
         if _norm_real != _norm_dst:
             try:
                 _common = os.path.commonpath([_norm_real, _norm_dst])
@@ -2067,41 +2161,60 @@ class Migrator:
         if not real.exists():
             return False, f"符号链接的真实数据不存在: {real_target}"
 
+        # ===== 空源防御（与 migrate() 步骤0.6 一致，防"空改迁假成功"）=====
+        # 真实数据目录 0 文件时拒绝，避免迁移空目录后误报成功（数据可能在别处）
+        try:
+            _real_fc = self._count_files_fast(real)
+            if _real_fc == 0:
+                log_error_with_reason("改迁源为空",
+                    f"real_target={real_target}", "拒绝改迁空目录")
+                self._emit_log("warn",
+                    f"  ⚠️ 真实数据目录为空（0 个文件），拒绝改迁: {real.name}")
+                return False, (f"真实数据目录为空（0 个文件），已拒绝改迁：{real_target}\n"
+                              f"数据可能在其他位置（如链接指向的真实数据目录），"
+                              f"请确认路径正确后再操作。")
+        except Exception as e:
+            # 统计失败时保守放行
+            log.warning(f"改迁源文件数统计失败（放行）: {e}")
+
         # 检查目标盘是否存在（防止 U 盘被拔、盘符错误等情况导致 mkdir 崩溃）
-        if dst.is_absolute():
-            dst_root = dst.anchor
+        if dst_data.is_absolute():
+            dst_root = dst_data.anchor
             if not os.path.exists(dst_root):
-                log_error_with_reason("目标盘不存在", context=f"改迁: {src_path} -> {dst_path}")
+                log_error_with_reason("目标盘不存在", context=f"改迁: {src_path} -> {dst_full}")
                 return False, f"目标盘不存在: {dst_root}（请检查目标盘是否已连接）"
 
         # 确保目标父目录存在
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst_data.parent.mkdir(parents=True, exist_ok=True)
         except (OSError, FileNotFoundError) as e:
             log_error_with_reason("目标目录创建失败",
-                f"无法创建目录: {e}", f"改迁: {src_path} -> {dst_path}")
-            return False, f"目标目录创建失败: {dst.parent}\n错误: {e}"
+                f"无法创建目录: {e}", f"改迁: {src_path} -> {dst_full}")
+            return False, f"目标目录创建失败: {dst_data.parent}\n错误: {e}"
 
         # ===== 步骤0：清理目标路径的残留符号链接 =====
         # 如果目标路径是符号链接（包括断链），复制引擎会跟着链接走
         # 导致数据写错位置或产生链式链接，必须先删除符号链接（只删链接不删数据）
         # 注意：os.path.exists 对断链符号链接返回 False，所以用 is_symlink 判断
-        if is_symlink(dst_path):
-            try:
-                os.rmdir(dst_path)
-                log.info(f"改迁: 删除目标路径残留符号链接: {dst_path}")
-                self._emit_log("migrate", f"  🔗 已清理目标路径残留符号链接: {os.path.basename(dst_path)}")
-            except Exception as e:
-                # 删除失败必须中止，否则 复制引擎会跟着符号链接走，产生链式链接
-                log_error_with_reason("目标路径符号链接清理失败",
-                    f"无法删除符号链接: {e}", f"改迁: {src_path} -> {dst_path}")
-                return False, (f"目标路径已存在符号链接但无法删除: {dst_path}\n"
-                              f"错误: {e}\n"
-                              f"请手动删除该符号链接后重试。")
+        # 包裹语义下：数据落在 dst_full（dst_path\源名），两个位置都可能残留链接
+        for _check_link in (dst_path, dst_full):
+            if is_symlink(_check_link):
+                try:
+                    os.rmdir(_check_link)
+                    log.info(f"改迁: 删除目标路径残留符号链接: {_check_link}")
+                    self._emit_log("migrate", f"  🔗 已清理目标路径残留符号链接: {os.path.basename(_check_link)}")
+                except Exception as e:
+                    # 删除失败必须中止，否则 复制引擎会跟着符号链接走，产生链式链接
+                    log_error_with_reason("目标路径符号链接清理失败",
+                        f"无法删除符号链接: {e}", f"改迁: {src_path} -> {_check_link}")
+                    return False, (f"目标路径已存在符号链接但无法删除: {_check_link}\n"
+                                  f"错误: {e}\n"
+                                  f"请手动删除该符号链接后重试。")
 
         # ===== 步骤0.5：目标非空警告（防止误删用户文件）=====
+        # 包裹语义下检查实际数据位置 dst_full（目标根原有文件不受影响）
         if not force_overwrite:
-            is_nonempty, warning = self._check_dst_nonempty(dst_path, src_path)
+            is_nonempty, warning = self._check_dst_nonempty(dst_full, src_path)
             if is_nonempty:
                 return False, f"NEED_CONFIRM_OVERWRITE\n{warning}"
 
@@ -2110,8 +2223,8 @@ class Migrator:
             # 使用 lstat 而非 stat，避免跟随符号链接导致重复计算或循环
             # 排除符号链接文件，防止嵌套链接造成空间计算虚高
             real_size = self._real_size_bytes_fast(real)  # #25:MFT 优先,跨盘回退
-            if dst.is_absolute():
-                dst_drive = dst.anchor
+            if dst_data.is_absolute():
+                dst_drive = dst_data.anchor
                 dst_usage = shutil.disk_usage(dst_drive)
                 real_mb = real_size // 1024 // 1024
                 free_mb = dst_usage.free // 1024 // 1024
@@ -2133,24 +2246,27 @@ class Migrator:
         pending[:] = [p for p in pending if p.get("src") != src_path]
         pending.append({
             "src": str(src),
-            "dst": str(dst),
+            "dst": str(dst_data),  # 包裹语义：记录实际数据位置（dst_path\源名）
             "stage": "started",
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "type": "relocate",
             "real_target": real_target,
+            # merge 标志：断电恢复续传时保持合并复制语义（不 purge 目标多余文件）
+            "merge": merge,
         })
         save_all(self.cfg)
 
-        log.info(f"改迁符号链接: {src_path} (真实数据在 {real_target}) → {dst_path}")
-        self._emit_log("migrate", f"📤 改迁: {src.name} | {real_target} → {dst_path}")
+        log.info(f"改迁符号链接: {src_path} (真实数据在 {real_target}) → {dst_full}")
+        self._emit_log("migrate", f"📤 改迁: {src.name} | {real_target} → {dst_full}")
 
         # ===== 步骤2：复制引擎真实数据到新位置 =====
         self._emit_log("migrate", f"  ⏳ 正在复制数据（镜像模式）: {src.name}...")
-        rc = self._run_copy_with_progress(real_target, str(dst), action_label="改迁")
+        rc = self._run_copy_with_progress(real_target, dst_full, action_label="改迁",
+                                          merge=merge)
         if rc >= 8 or rc == _CANCELLED_RC:
             short_log, long_msg = self._format_copy_fail(rc, src_path, "改迁")
             log_error_with_reason("改迁复制失败",
-                f"返回码: {rc}", f"改迁: {real_target} -> {dst_path}")
+                f"返回码: {rc}", f"改迁: {real_target} -> {dst_full}")
             self._emit_log("error", f"{short_log}: {src.name}")
             for p in pending:
                 if p.get("src") == src_path:
@@ -2175,7 +2291,7 @@ class Migrator:
         # ===== 步骤3：文件数验证 =====
         try:
             src_fc = self._count_files_fast(real)
-            dst_fc = self._count_files_fast(dst)
+            dst_fc = self._count_files_fast(dst_data)
         except Exception as e:
             # 验证异常时保守中止，不绕过验证继续删源（会导致双端丢失）
             log_error_with_reason("改迁完整性验证异常",
@@ -2227,9 +2343,9 @@ class Migrator:
                           f"已记录未完成事务，下次启动程序会自动重试。\n"
                           f"或请手动删除该符号链接后重启程序。")
 
-        # ===== 步骤5：创建新链接 src_path → dst_path（符号链接 /D 优先）=====
-        self._emit_log("migrate", f"  🔗 正在创建新链接: {src.name} → {dst}")
-        mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst))
+        # ===== 步骤5：创建新链接 src_path → dst_full（符号链接 /D 优先）=====
+        self._emit_log("migrate", f"  🔗 正在创建新链接: {src.name} → {dst_data}")
+        mklink_ok, mklink_err = self._create_dir_link(str(src), str(dst_data))
         if not mklink_ok:
             # 建链失败：旧链接已删，新链接没建起来，数据在 dst 和 real_target 都有
             # 手动恢复旧链接，让用户还能通过旧路径访问数据
@@ -2294,7 +2410,7 @@ class Migrator:
         # 3. 如果 src 在 C 盘，更新其 dst 指向新目标（保持一对一）
         # 4. 最后用 _add_migrated_record 写入当前 src→dst（按 src 去重替换）
         _norm_rt = os.path.normpath(real_target).lower()
-        _norm_dst = os.path.normpath(str(dst)).lower()
+        _norm_dst = os.path.normpath(str(dst_data)).lower()
         _norm_src = os.path.normpath(src_path).lower()
         cleaned_stale = []
         for m in self.cfg.get("migrated", []):
@@ -2314,9 +2430,9 @@ class Migrator:
                 _is_c = m_src_path.lower().startswith("c:")
                 if _is_c:
                     # C 盘 src：更新 dst 指向新目标，保持一对一
-                    m["dst"] = str(dst)
+                    m["dst"] = str(dst_data)
                     m["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    log.info(f"改迁多对一清理: 更新 C 盘记录 {m_src} → {dst}")
+                    log.info(f"改迁多对一清理: 更新 C 盘记录 {m_src} → {dst_data}")
                 else:
                     # 非 C 盘 src：删除符号链接（如果有），重建空目录，移除记录
                     if is_symlink(m_src_path):
@@ -2340,14 +2456,14 @@ class Migrator:
             self._emit_log("migrate",
                 f"  ✅ 清理 {len(cleaned_stale)} 条多对一残留记录（旧数据目录已清空）")
         # _add_migrated_record 自动去重同 src 旧记录
-        self._add_migrated_record(str(src), str(dst))
+        self._add_migrated_record(str(src), str(dst_data))
         pending[:] = [p for p in pending if p.get("src") != src_path]
         save_all(self.cfg)
-        log.info(f"改迁成功: src={src}, dst={dst}")
+        log.info(f"改迁成功: src={src}, dst={dst_data}")
 
-        self._emit_log("migrate", f"  ✅ 改迁完成: {src.name} → {dst}（旧数据 {real.name} 已清理）")
+        self._emit_log("migrate", f"  ✅ 改迁完成: {src.name} → {dst_data}（旧数据 {real.name} 已清理）")
         self._maybe_clean_vss()
-        return True, f"改迁成功: {src.name} → {dst_path}"
+        return True, f"改迁成功: {src.name} → {dst_full}"
 
     def fix_chain_symlinks(self):
         r"""启动时扫描并修复历史链式符号链接 + 多对一冲突
@@ -2808,7 +2924,8 @@ class Migrator:
                                 continue
                             log.info(f"src是符号链接，dst无数据，从真实目标续传: {real_target} -> {dst}")
                             self._emit_log("migrate", f"  ⏳ 从真实目标续传: {os.path.basename(src)}...")
-                            rc = self._run_copy_with_progress(real_target, dst, action_label="续传")
+                            rc = self._run_copy_with_progress(real_target, dst, action_label="续传",
+                                                              merge=p.get("merge", False))
                             if rc >= 8 or rc == _CANCELLED_RC:
                                 short_log, long_msg = self._format_copy_fail(rc, src, "续传")
                                 self._emit_log("error", f"从真实目标续传 {short_log}")
@@ -2866,7 +2983,8 @@ class Migrator:
                         # C 盘是真实目录，继续 复制引擎续传（/MIR 自动补齐）
                         log.info(f"续传复制: {src} -> {dst}")
                         self._emit_log("migrate", f"  ⏳ 续传复制数据: {os.path.basename(src)}...")
-                        rc = self._run_copy_with_progress(src, dst, action_label="续传")
+                        rc = self._run_copy_with_progress(src, dst, action_label="续传",
+                                                          merge=p.get("merge", False))
                         if rc >= 8 or rc == _CANCELLED_RC:
                             # 仍失败：保留目标盘已有数据，等下次再试
                             # 不清理目标盘，避免浪费已复制的进度
@@ -3108,7 +3226,8 @@ class Migrator:
                 # 需要续传
                 log.info(f"改迁恢复: 从 {real_target} 续传到 {dst}")
                 self._emit_log("migrate", f"  ⏳ 改迁续传: {os.path.basename(src)}...")
-                rc = self._run_copy_with_progress(real_target, dst, action_label="改迁续传")
+                rc = self._run_copy_with_progress(real_target, dst, action_label="改迁续传",
+                                                  merge=p.get("merge", False))
                 if rc >= 8 or rc == _CANCELLED_RC:
                     short_log, long_msg = self._format_copy_fail(rc, src, "改迁续传")
                     self._emit_log("error", short_log)
@@ -4293,7 +4412,7 @@ class Migrator:
                     if not is_symlink(full_path):
                         continue
                     # 只补录符号链接（本工具迁移产物，_create_dir_link /D 优先）
-                    # 过滤 junction：手动建的目录联接（.hermes → G:\AI\... 等）和
+                    # 过滤 junction：手动建的目录联接（.hermes → G:\... 等）和
                     # 系统 XP 兼容链接都不是本工具迁移产物，补录会干扰用户选择
                     # （用户可能误点"还原"把目标盘数据复制回 C 盘）
                     if is_junction(full_path):
@@ -4351,6 +4470,34 @@ class Migrator:
             log_error_with_reason("创建链接失败", lerr, f"修复链接(缺失): {src_path} -> {dst_path}")
             return False, f"创建链接失败: {lerr}"
         if is_symlink(src_path):
+            # 链接存在时检查指向是否与目标一致（包裹语义下记录 dst 是实际数据位置）
+            # 实测事故（2026-08-13）：改迁后链接指向与记录 dst 不一致（双重嵌套残留），
+            # 原逻辑直接返回"无需修复"，用户看到断链却修复无效
+            try:
+                cur_target = get_symlink_target(src_path) or ""
+                cur_target = cur_target.replace("\\\\?\\", "")
+                if (cur_target and
+                        os.path.normcase(os.path.normpath(cur_target)) !=
+                        os.path.normcase(os.path.normpath(str(dst)))):
+                    # 指向不一致：删除旧链接，重建指向 dst（只删链接不删数据）
+                    try:
+                        if os.path.isdir(src_path):
+                            os.rmdir(src_path)
+                        else:
+                            os.unlink(src_path)
+                    except Exception as e:
+                        log_error_with_reason("删除错误指向的链接失败",
+                            str(e), f"修复链接: {src_path}")
+                        return False, f"删除错误指向的符号链接失败: {e}"
+                    ok, lerr = self._create_dir_link(str(src), str(dst))
+                    if ok:
+                        log_link_operation("修复链接(指向修正)", str(src), str(dst),
+                                           f"原指向 {cur_target}，已重建指向 {dst}")
+                        return True, f"链接指向已修正: {src.name} → {dst}"
+                    log_error_with_reason("重建链接失败", lerr, f"修复链接: {src_path}")
+                    return False, f"重建链接失败: {lerr}"
+            except Exception as e:
+                log.debug("忽略异常: %s", e)
             return True, "符号链接已存在，无需修复"
         # C盘是真实目录（被软件覆盖），需合并数据后重建链接
         # 检查目标盘是否存在

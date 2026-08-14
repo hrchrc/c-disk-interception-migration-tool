@@ -65,3 +65,6 @@ src/mft/mft_fast.c
 ai_recognize_cache.json
 rust-engine/bench*.log
 docs/decisions.md
+
+# ===== 本机真实链路测试脚本（含个人路径，不发布）=====
+bin/test_android_chain.py

@@ -53,6 +53,17 @@ import dev_env_snapshot as dev_snapshot
 log = logging.getLogger('CDriveRelocator')
 
 
+def _wrap_src_name(src_path):
+    """源文件夹名（包裹用）：套娃源照搬完整段（如 dve\\dve），否则单层名
+    与 migrator._get_source_wrap_name 一致，用于 target_path 记录/消息显示
+    """
+    try:
+        from migrator import _get_source_wrap_name
+        return _get_source_wrap_name(src_path)
+    except Exception:
+        return os.path.basename(str(src_path).rstrip("\\/"))
+
+
 class DevEnvHandler:
     """开发环境迁移功能 Handler"""
 
@@ -1735,6 +1746,12 @@ class DevEnvHandler:
                 tools_to_apply.append(t)
         # 取消正在运行的后台扫描线程（迁移时会删除 C 盘目录，避免并发访问冲突）
         self._safe_cancel_dev_env_worker("_dev_env_refresh_worker")
+        # 批量覆盖确认重试的闭包状态：缓存"无需重试的工具结果"，
+        # 重试完成后与重试结果合并，保证汇总/记录保存/局部刷新覆盖全部工具
+        # （否则已成功的工具在重试后丢失 dev_env_configured 记录与显示）
+        # 定义在 worker 创建之前：任何路径（含 error_signal）进入时都已初始化
+        carry_results = []
+
         worker = DevEnvApplyWorker(tools_to_apply, target_drive,
                                    migrate_data=migrate_data, config=self.cfg)
         self._dev_env_apply_worker = worker
@@ -1757,6 +1774,10 @@ class DevEnvHandler:
             worker_results 是 [(tool, ok, msg, source_path), ...] 列表
             """
             try:
+                # 覆盖确认重试完成后：把先前"无需重试的工具结果"合并回来
+                if carry_results:
+                    worker_results = carry_results + list(worker_results)
+                    carry_results[:] = []
                 # 确保 worker 线程完全退出，避免模态对话框期间的竞态
                 try:
                     worker.wait(500)
@@ -1764,6 +1785,51 @@ class DevEnvHandler:
                     log.debug("忽略异常: %s", e)
                 self.progress.setVisible(False)
                 self.btn_apply_dev.setEnabled(True)
+                # 处理目标非空警告：含 NEED_CONFIRM_OVERWRITE 的失败项弹确认框
+                # 确认后带 force_overwrite+merge 重跑数据迁移（合并复制，目标原有文件保留）
+                need_confirm = [(t, sp) for t, ok, msg, sp in worker_results
+                                if not ok and "NEED_CONFIRM_OVERWRITE" in msg]
+                if need_confirm:
+                    names = "、".join(t["name"] for t, _ in need_confirm)
+                    ret = QMessageBox.warning(self, "⚠ 目标目录非空",
+                        f"以下工具的目标目录已存在且非空：\n{names}\n\n"
+                        f"点击「是」将把源文件夹合并复制进目标目录，"
+                        f"目标中原有文件保留（同名文件覆盖）；点「否」跳过这些工具。",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if ret == QMessageBox.Yes:
+                        self.status_label.setText(
+                            f"正在重试 {len(need_confirm)} 个工具的数据迁移（覆盖确认）...")
+                        self.on_monitor_log("dev_env",
+                            f"用户确认覆盖目标目录，重试数据迁移（合并复制）: {names}")
+                        self.progress.setVisible(True)
+                        self.progress.setRange(0, len(need_confirm))
+                        self.progress.setValue(0)
+                        self.progress.setFormat(f"覆盖确认重试中 0/{len(need_confirm)} (%p%)")
+                        # 重试期间重新禁用按钮，防止重复点击并发
+                        self.btn_apply_dev.setEnabled(False)
+                        # 缓存无需重试的工具结果（成功项或非覆盖类失败项），重试完成后合并
+                        confirm_ids = {t["id"] for t, _ in need_confirm}
+                        carry_results[:] = [
+                            r for r in worker_results
+                            if r[0]["id"] not in confirm_ids
+                        ]
+                        retry_worker = DevEnvApplyWorker(
+                            [t for t, _ in need_confirm], drive,
+                            migrate_data=True, config=self.cfg,
+                            force_overwrite=True, merge_overwrite=True,
+                            skip_apply=True,
+                            source_path_overrides={t["id"]: sp for t, sp in need_confirm})
+                        self._dev_env_apply_worker = retry_worker
+                        retry_worker.finished_signal.connect(_on_done)
+                        retry_worker.progress_signal.connect(_on_apply_progress2)
+                        retry_worker.verbose_log_sig.connect(
+                            self._log_monitor, Qt.QueuedConnection)
+                        retry_worker.error_signal.connect(_on_error)
+                        retry_worker.start()
+                        return
+                    else:
+                        self.on_monitor_log("dev_env",
+                            f"用户取消覆盖，以下工具配置中止: {names}")
                 # 转成 [(name, ok, msg), ...] 格式（丢弃 source_path，下面单独取）
                 results = [(t["name"], ok, msg) for t, ok, msg, _ in worker_results]
                 # 汇总结果
@@ -1791,8 +1857,16 @@ class DevEnvHandler:
                                         "name": tool["name"],
                                         "category": tool["category"],
                                         "target_drive": drive,
-                                        "target_path": custom_paths.get(tool["id"],
-                                            dev_get_suggest_path(tool, drive)),
+                                        # 包裹语义：记录实际数据位置（目标目录 + 源文件夹名）
+                                        "target_path": (
+                                            os.path.join(
+                                                custom_paths.get(tool["id"],
+                                                    dev_get_suggest_path(tool, drive)),
+                                                _wrap_src_name(source_path))
+                                            if source_path else
+                                            custom_paths.get(tool["id"],
+                                                dev_get_suggest_path(tool, drive))
+                                        ),
                                         "env_vars": [ev["name"] for ev in tool["env_vars"]],
                                         "configured_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                         "clean_guide": tool["clean_guide"],
@@ -1872,6 +1946,8 @@ class DevEnvHandler:
 
         def _on_error(err):
             try:
+                # 重试失败（error_signal）时清空缓存的待合并结果，防止残留串到下次配置
+                carry_results[:] = []
                 self.btn_apply_dev.setEnabled(True)
                 self.progress.setVisible(False)
                 self.status_label.setText(f"配置失败: {err}")
@@ -2421,7 +2497,7 @@ class DevEnvHandler:
             if not cand:
                 continue
             # 从 cand 向上逐级检查祖先目录是否是符号链接
-            # 如 cand = C:\Users\aaa\AppData\Local\Android\Sdk
+            # 如 cand = C:\Users\xxx\AppData\Local\Android\Sdk
             # 依次检查 C:\...\Android, C:\...\Local, ... 直到根
             cur = cand
             for _ in range(10):  # 最多向上 10 级，避免无限循环
@@ -2695,7 +2771,20 @@ class DevEnvHandler:
                                             f"[反向搬数据] 异常: {e}\n{traceback.format_exc()[-300:]}")
                                         data_ok = False
                                 else:
-                                    detail_msgs.append("[还原数据] 无迁移记录，仅撤销配置")
+                                    # 无迁移记录且无数据路径，区分两种场景：
+                                    # 1. dev_env_configured 有记录 → "仅配置未迁移"：
+                                    #    撤销配置已完成，C 盘数据本就未迁移，还原成功
+                                    # 2. 完全无记录 → 本工具未通过本程序配置/迁移过：
+                                    #    必须报失败而非"还原成功"（此前实测 src_path=None
+                                    #    仍显示成功，误导用户以为数据已还原）
+                                    dev_env_cfg = self.config.get("dev_env_configured") or {}
+                                    if tool.get("id", "") in dev_env_cfg:
+                                        detail_msgs.append(
+                                            "[还原数据] 无迁移记录，C 盘数据未迁移，仅撤销配置")
+                                    else:
+                                        detail_msgs.append(
+                                            "[还原数据] 未找到该工具的迁移/配置记录，未执行任何数据操作")
+                                        data_ok = False
                             except Exception as e:
                                 # 单个工具处理异常：记录错误，继续处理下一个工具（不崩溃）
                                 import traceback
@@ -2891,9 +2980,13 @@ class DevEnvHandler:
         suggest = custom_path or dev_get_suggest_path(tool, target_drive)
 
         # 第一道确认：显示具体目标路径
+        # 包裹语义：数据将整体放入 目标路径\源文件夹名 下（此处 source_path 尚未捕获，
+        # 用文案说明结构，具体位置在下方三选一弹窗中显示）
         reply = QMessageBox.question(self, "确认配置",
             f"即将配置 {tool['name']}\n\n"
-            f"  目标路径: {suggest}\n\n"
+            f"  目标路径: {suggest}\n"
+            f"  （迁移时源文件夹将整体放入 {suggest}\\源文件夹名 下，"
+            f"目标目录原有文件不受影响）\n\n"
             f"是否继续？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
@@ -2934,13 +3027,17 @@ class DevEnvHandler:
             else:
                 advice = f"💡 检测到仅 {_format_size(size_mb)} 数据，数据量少，可只配置不迁移"
                 default_btn = QMessageBox.No
+            # 包裹语义：数据实际位置 = 目标 + 源文件夹名（此时 info.source_path 已知）
+            _src_name3 = os.path.basename((info.get("source_path") or "").rstrip("\\/"))
+            _real_suggest = os.path.join(suggest, _src_name3) if _src_name3 else suggest
             # 三选一弹窗：Yes=配置+迁移 / No=只配置 / Cancel=退出
             reply = QMessageBox.question(self, "选择操作方式",
                 f"{tool['name']} {data_loc_desc}\n\n"
-                f"目标路径: {suggest}\n\n"
+                f"目标路径: {suggest}\n"
+                f"数据实际位置: {_real_suggest}\n\n"
                 f"{advice}\n\n"
                 f"  • 『Yes』配置 + 迁移数据（复制 + 符号链接）\n"
-                f"     数据搬到 {suggest}\n"
+                f"     数据搬到 {_real_suggest}\n"
                 f"     迁移后原位置变符号链接指向新路径\n\n"
                 f"  • 『No』只配置环境变量\n"
                 f"     现有数据不动，以后新装的去 {suggest}\n\n"
@@ -3003,7 +3100,14 @@ class DevEnvHandler:
                             "name": tool["name"],
                             "category": tool["category"],
                             "target_drive": drive,
-                            "target_path": custom_path or dev_get_suggest_path(tool, drive),
+                            # 包裹语义：记录实际数据位置（目标目录 + 源文件夹名）
+                            "target_path": (
+                                os.path.join(
+                                    custom_path or dev_get_suggest_path(tool, drive),
+                                    _wrap_src_name(source_path))
+                                if source_path else
+                                (custom_path or dev_get_suggest_path(tool, drive))
+                            ),
                             "env_vars": [ev["name"] for ev in tool["env_vars"]],
                             "configured_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "clean_guide": tool["clean_guide"],
@@ -3013,8 +3117,12 @@ class DevEnvHandler:
                     except Exception as e:
                         log.error(f"保存配置记录失败: {e}")
                     self.status_label.setText(f"{tool['name']} 配置完成")
+                    # 包裹语义：显示实际数据位置（目标 + 源文件夹名，套娃源照搬完整段）
+                    _real_msg_path = suggest
+                    if source_path:
+                        _real_msg_path = os.path.join(suggest, _wrap_src_name(source_path))
                     self.on_monitor_log("dev_env",
-                        f"✓ {tool['name']} 配置成功 → {suggest}")
+                        f"✓ {tool['name']} 配置成功 → {_real_msg_path}")
                     # 根据迁移情况生成说明（合并原"无需迁移数据"框的信息）
                     if migrate_data:
                         status_note = (
@@ -3062,6 +3170,55 @@ class DevEnvHandler:
                         except Exception as e:
                             log.error(f"刷新待迁移区失败: {e}")
                 else:
+                    # 目标目录非空：弹真正的覆盖确认框（合并复制，目标原有文件保留）
+                    # 与待迁移区 ui_migrate.py 的 NEED_CONFIRM_OVERWRITE 处理对齐；
+                    # 区别：开发环境区采用合并复制语义（merge=True，不 purge 目标多余文件），
+                    # 因此弹窗文案自定义，不复用 warning 原文中的"镜像同步会删除"描述
+                    if "NEED_CONFIRM_OVERWRITE" in msg:
+                        warning = msg.split("NEED_CONFIRM_OVERWRITE", 1)[1].strip("\n ")
+                        # 提取"目标目录已存在且非空：X / 包含 N 个条目"信息，
+                        # 过滤掉镜像同步警告与"是否覆盖目标目录？"（由本弹窗按钮表达）
+                        info_lines = [
+                            ln for ln in warning.splitlines()
+                            if "镜像同步" not in ln and "是否覆盖" not in ln
+                        ]
+                        info = "\n".join(info_lines).strip()
+                        ret = QMessageBox.warning(self, "⚠ 目标目录非空",
+                            f"{info}\n\n"
+                            f"点击「是」将把源文件夹合并复制进目标目录"
+                            f"（同名文件覆盖，目标中原有文件保留）；\n"
+                            f"点「否」取消本次配置。",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                        if ret == QMessageBox.Yes:
+                            self.status_label.setText(
+                                f"{tool['name']} 配置中（覆盖确认后重试数据迁移）...")
+                            self.on_monitor_log("dev_env",
+                                f"用户确认覆盖目标目录，重试数据迁移"
+                                f"（合并复制，目标原有文件保留）: {tool['name']}")
+                            # 重试：跳过 apply（环境变量已设置成功），只重跑数据迁移
+                            # 源路径必须用首次捕获的（环境变量已改，重新捕获会得到新路径）
+                            # force_overwrite 跳过非空检测 + merge 合并复制（不 purge）
+                            retry_worker = DevEnvApplyWorker(
+                                [tool], drive, migrate_data=True, config=self.cfg,
+                                target_path_override=custom_path if custom_path else None,
+                                force_overwrite=True, merge_overwrite=True,
+                                skip_apply=True,
+                                source_path_overrides={tool["id"]: source_path})
+                            self._dev_env_apply_worker = retry_worker
+                            retry_worker.finished_signal.connect(_on_done)
+                            retry_worker.progress_signal.connect(
+                                lambda c, t, m: self.on_monitor_log("dev_env", m))
+                            retry_worker.verbose_log_sig.connect(
+                                self._log_monitor, Qt.QueuedConnection)
+                            retry_worker.error_signal.connect(_on_error)
+                            retry_worker.start()
+                            return
+                        else:
+                            self.on_monitor_log("dev_env",
+                                f"用户取消覆盖目标目录，配置中止: {tool['name']}")
+                            self.status_label.setText(
+                                f"{tool['name']} 配置已取消（目标目录非空）")
+                            return
                     self.status_label.setText(f"{tool['name']} 配置失败")
                     self.on_monitor_log("dev_env",
                         f"✗ {tool['name']} 配置失败: {msg}")

@@ -19,6 +19,7 @@ log = logging.getLogger('CDriveRelocator')
 from dev_env_migrate import (
     get_tool_status as dev_get_tool_status,
     get_tool_data_info as dev_get_tool_data_info,
+    get_suggest_path as dev_get_suggest_path,
     apply_tool as dev_apply_tool,
     migrate_tool_data as dev_migrate_tool_data,
 )
@@ -497,11 +498,20 @@ class DevEnvApplyWorker(QThread):
     verbose_log_sig = Signal(str, str)  # migrator 阶段日志（开发工具区专用）
 
     def __init__(self, tools, target_drive, migrate_data=False, config=None,
-                 target_path_override=None):
+                 target_path_override=None, force_overwrite=False,
+                 merge_overwrite=False, skip_apply=False,
+                 source_path_overrides=None):
         """通用：支持任意盘间迁移
 
         :param target_path_override: 用户指定的目标路径（覆盖默认模板路径）
                支持 D→D / D→E / E→F 等任意盘间迁移
+        :param force_overwrite: True=跳过目标非空检测（覆盖确认重试时用）
+        :param merge_overwrite: True=合并复制（目标中原有文件保留，不 purge）
+        :param skip_apply: True=跳过 apply_tool，只重跑数据迁移
+               （覆盖确认重试时环境变量已设置成功，不能重复设置）
+        :param source_path_overrides: dict 按 tool id 提供源路径覆盖
+               （重试时环境变量已指向目标，重新捕获会得到新路径，
+               必须用首次配置时捕获的源路径）
         """
         super().__init__()
         self.tools = tools
@@ -509,9 +519,19 @@ class DevEnvApplyWorker(QThread):
         self.migrate_data = migrate_data  # 是否同时迁移数据
         self.config = config  # state.json 配置（用于记录 migrated）
         self.target_path_override = target_path_override  # 用户指定的目标路径
+        self.force_overwrite = force_overwrite
+        self.merge_overwrite = merge_overwrite
+        self.skip_apply = skip_apply
+        self.source_path_overrides = source_path_overrides or {}
 
     def run(self):
         try:
+            # 防御：skip_apply 只对"覆盖确认后重试数据迁移"有效，
+            # 必须同时要求迁移数据，否则会静默假成功（apply 和 migrate 都跳过）
+            if self.skip_apply and not self.migrate_data:
+                self.error_signal.emit(
+                    "内部错误：skip_apply=True 必须配合 migrate_data=True")
+                return
             results = []
             total = len(self.tools)
             for i, tool in enumerate(self.tools):
@@ -523,18 +543,61 @@ class DevEnvApplyWorker(QThread):
                     # 0. 配置前捕获源路径（用于数据迁移和待迁移区橙色提示）
                     # 必须在 apply_tool 之前调用，因为 apply_tool 会改环境变量导致
                     # current_path_fn 返回新路径而非原始路径
-                    try:
-                        info = dev_get_tool_data_info(tool)
-                        source_path = info.get("source_path", "")
-                    except Exception as e:
-                        log.debug("忽略异常: %s", e)
+                    # 覆盖确认重试时：环境变量已指向目标，不能重新捕获，
+                    # 必须用首次配置时捕获的源路径（source_path_overrides）
+                    source_path = self.source_path_overrides.get(tool["id"], "")
+                    if not source_path:
+                        try:
+                            info = dev_get_tool_data_info(tool)
+                            source_path = info.get("source_path", "")
+                        except Exception as e:
+                            log.debug("忽略异常: %s", e)
+                    # 防环境变量残留误导：C 盘默认路径有真实数据（非链接）时优先用 C 盘
+                    # （环境变量可能残留指向目标路径（套娃），导致源捕获错误——
+                    #  实测事故 2026-08-14：源=D:\dev\android\sdk\Sdk 与目标包含冲突）
+                    if source_path and not source_path.lower().startswith("c:"):
+                        try:
+                            from utils import is_symlink as _is_symlink
+                            from dev_env_migrate import get_tool_default_c_path as _get_c
+                            _c = _get_c(tool)
+                            if _c and os.path.isdir(_c) and not _is_symlink(_c):
+                                source_path = _c.replace("\\\\?\\", "")
+                        except Exception:
+                            pass
                     # 1. 应用配置（环境变量+配置命令）
                     # 通用：传 target_path_override 让环境变量指向用户指定的路径
-                    if self.migrate_data:
+                    # 覆盖确认重试时跳过（环境变量已设置成功，避免重复设置）
+                    # 包裹语义：迁移数据时环境变量必须指向实际数据位置
+                    # （目标目录 + 源文件夹名），否则工具访问目标根目录找不到数据
+                    ok, msg = True, ""
+                    if not self.skip_apply:
+                        if self.migrate_data:
+                            self.progress_signal.emit(i, total,
+                                f"[{i+1}/{total}] {tool['name']}: 配置环境变量+迁移数据中...")
+                        apply_override = self.target_path_override
+                        if self.migrate_data and source_path:
+                            # 源文件夹名：套娃源照搬完整段（与 migrator.migrate 一致）
+                            from migrator import _get_source_wrap_name
+                            _src_name = _get_source_wrap_name(source_path)
+                            if _src_name:
+                                # 包裹语义：环境变量指向实际数据位置 = 目标 + 源文件夹名
+                                # 用户未自定义路径时用默认建议路径作基础
+                                # 防套娃（与 migrator.migrate 规则一致）：目标 basename 与源名
+                                # 相同（忽略大小写）时不拼源名，直接指向目标
+                                # （修复：os.path.join("", 源名) 产生相对路径 "Sdk" 被拒绝；
+                                #   以及 D:\dev\android\sdk + Sdk 套娃为 ...\sdk\Sdk，实测 2026-08-14）
+                                base = (self.target_path_override
+                                        or dev_get_suggest_path(tool, self.target_drive))
+                                _base_name = os.path.basename(base.rstrip("\\/"))
+                                if _base_name and _base_name.lower() == _src_name.lower():
+                                    apply_override = base
+                                else:
+                                    apply_override = os.path.join(base, _src_name)
+                        ok, msg = dev_apply_tool(tool, self.target_drive,
+                                                  target_path_override=apply_override)
+                    else:
                         self.progress_signal.emit(i, total,
-                            f"[{i+1}/{total}] {tool['name']}: 配置环境变量+迁移数据中...")
-                    ok, msg = dev_apply_tool(tool, self.target_drive,
-                                              target_path_override=self.target_path_override)
+                            f"[{i+1}/{total}] {tool['name']}: 重试数据迁移（覆盖确认）...")
                     # 2. 如果配置成功且用户要求迁移数据，执行数据迁移
                     if ok and self.migrate_data:
                         try:
@@ -544,7 +607,9 @@ class DevEnvApplyWorker(QThread):
                                 tool, self.target_drive, self.config,
                                 source_path_override=source_path or None,
                                 target_path_override=self.target_path_override,
-                                log_callback=lambda et, m: self.verbose_log_sig.emit(et, m))
+                                log_callback=lambda et, m: self.verbose_log_sig.emit(et, m),
+                                force_overwrite=self.force_overwrite,
+                                merge=self.merge_overwrite)
                             msg = msg + "\n  [数据迁移] " + mmsg
                             if not mok:
                                 # 数据迁移失败：环境变量配置成功了，但数据没迁移

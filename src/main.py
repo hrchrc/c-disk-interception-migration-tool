@@ -115,7 +115,7 @@ from ui_monitor_log import MonitorLogHandler
 from ui_lifecycle import LifecycleHandler
 from ui_widgets import (
     NumericTableWidgetItem, WideEditorDelegate, NoElideDelegate,
-    _format_size, _apply_size_item_color,
+    _format_size, _apply_size_item_color, OneLineLabel,
 )
 from ui_workers import (
     DevEnvRefreshWorker, DevEnvSizeWorker,
@@ -747,13 +747,14 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         t1 = QVBoxLayout(tab1)
         t1.setContentsMargins(0, 0, 0, 0)
         self.table_migrated = QTableWidget(0, 7)
-        self.table_migrated.setHorizontalHeaderLabels(["C盘路径", "目标盘", "大小(MB)", "状态", "目标路径", "说明", "迁移时间"])
+        # 已迁移区支持任意盘间迁移（含 D→D / D→E），首列显示源路径而非"C盘路径"
+        self.table_migrated.setHorizontalHeaderLabels(["源路径", "目标盘", "大小(MB)", "状态", "目标路径", "说明", "迁移时间"])
         header_m = self.table_migrated.horizontalHeader()
         header_m.setSectionResizeMode(QHeaderView.Interactive)
         # 每列最小列宽100px（防止拖太窄直接变三个点）
         header_m.setMinimumSectionSize(100)
         header_m.setDefaultSectionSize(120)
-        header_m.resizeSection(0, 420)  # C盘路径（加宽：路径完整显示更久才到边界）
+        header_m.resizeSection(0, 420)  # 源路径（加宽：路径完整显示更久才到边界）
         header_m.resizeSection(1, 420)  # 目标盘（原200太窄，显示28字符就出三点）
         header_m.resizeSection(2, 100)
         header_m.resizeSection(3, 120)
@@ -982,6 +983,8 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
 <li><b>随时还原</b>：如需还原，切换到"已迁移"标签页，选中后右键选"还原"，数据自动搬回 C 盘</li>
 </ol>
 <p><b>提示</b>：迁移不影响软件运行，符号链接对软件完全透明，照常读写数据。建议以管理员身份运行以获得完整权限。</p>
+
+<p><b>⚠️ 迁移方式（重要）</b>：本软件<b>只支持迁移文件夹</b>（不支持单独迁移单个文件）。迁移时把<b>整个源文件夹</b>（保留文件夹名）放入目标目录——例如迁移 <code>C:/Users/…/Android/Sdk</code> 到 <code>D:/</code> 后，数据位于 <code>D:/Sdk/</code> 下，C 盘原路径自动变为符号链接指向 <code>D:/Sdk</code>。目标目录原有的文件与迁移数据<b>天然隔离</b>，不会被覆盖或删除。</p>
 
 <h3>二、待迁移标签页</h3>
 <p>列出 C 盘 6 个关键目录 + 当前用户目录下的一级子目录及大小，自动识别每个目录对应的软件名称。</p>
@@ -1524,7 +1527,9 @@ class MainWindow(QMainWindow, DevEnvHandler, SnapshotHandler, AIHandler, Whiteli
         # 首次进入该 Tab 时自动检测（延迟，避免启动卡顿）
         self.tabs.currentChanged.connect(self._on_dev_env_tab_changed)
 
-        self.status_label = QLabel("就绪")
+        # OneLineLabel：长错误消息自动压成单行并截断（原文入 tooltip），
+        # 防止多行消息把状态栏撑高（此前开发环境区配置失败会撑大状态栏）
+        self.status_label = OneLineLabel("就绪")
         self.statusBar().addWidget(self.status_label)
         # 待处理事务按钮：点击查看所有 fail_count >= 2 的事务（用户决策入口）
         # 默认可见但禁用（灰色），有待处理事务时启用+橙色，让用户始终能看到入口
@@ -1784,6 +1789,17 @@ def main():
             log.info(f"启动时清理了 {len(cleaned)} 个坏环境变量: {cleaned}")
     except Exception as e:
         log.error(f"启动时清理坏环境变量失败: {e}")
+
+    # 启动自愈：清除软件管理变量的环境变量残留（注册表无但进程有）
+    # 实测事故（2026-08-13）：配置写入进程环境后注册表被外部清理，从旧进程链
+    # 启动的软件继承残留导致检测显示旧路径（H:\...）；启动即清恢复默认检测
+    try:
+        from dev_env_migrate import clean_env_var_residues
+        cleaned_res = clean_env_var_residues()
+        if cleaned_res:
+            log.info(f"启动自愈：清除 {len(cleaned_res)} 个环境变量残留: {cleaned_res}")
+    except Exception as e:
+        log.error(f"启动自愈清理环境变量残留失败: {e}")
 
     try:
         log.info("步骤1: 创建QApplication...")
